@@ -2,7 +2,7 @@
   name        = "quokka"
   version     = "0.1.0"
   edition     = "2024"
-  description = "A TPX-style external test runner for Buck2, specialized for Rust tests."
+  description = "A better external test runner for Buck2"
   license     = "MIT OR Apache-2.0"
 
 [[bin]]
@@ -56,13 +56,9 @@
   strip = "symbols"
 
 [lints.clippy]
-  collapsible_if       = "allow" # fix involving let not stable yet
   enum_glob_use        = "warn"
   or_fun_call          = "warn"
-  result_large_err     = "allow"
-  single_match         = "allow"
   string_slice         = "warn"  # Warn on string slicing to prevent UTF-8 boundary issues
-  to_string_trait_impl = "allow"
   unused_async         = "warn"
   unwrap_used          = "warn"
 
