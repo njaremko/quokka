@@ -11,10 +11,6 @@ Point a host repo's `.buckconfig` at the built binary to use it:
   v2_test_executor = /path/to/quokka
 ```
 
-The authoritative design — protocol wire-pinning, the scheduler data model,
-retry/verdict state machine, batching and caching semantics — is in
-[`DESIGN.md`](./DESIGN.md).
-
 ## Layout
 
 | Path | What |
