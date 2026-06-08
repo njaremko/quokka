@@ -1,0 +1,4 @@
+# Windows import-library crate, pulled in transitively for the windows target.
+# Its build script only emits link directives relevant on Windows; quokka builds
+# only on macOS/Linux, so the script never needs to run.
+buildscript.run = false

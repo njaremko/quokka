@@ -1,0 +1,3 @@
+# Reads `env!("CARGO_PKG_VERSION")` at compile time; inject the standard
+# CARGO_* vars reindeer otherwise omits.
+cargo_env = true

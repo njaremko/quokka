@@ -1,0 +1,3 @@
+# clap_builder doc-includes its README and (for the `unstable-doc` cfg) its
+# own Cargo.toml; vendor both as sources.
+extra_srcs = ["README.md", "Cargo.toml"]

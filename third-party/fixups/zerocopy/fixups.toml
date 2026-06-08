@@ -1,0 +1,5 @@
+# zerocopy embeds `env!("CARGO_PKG_VERSION")` inside `#[doc = concat!(...)]`
+# attributes, so the version must be present in rustc's environment at compile
+# time. `cargo_env` injects the standard CARGO_* vars reindeer otherwise omits.
+cargo_env = true
+buildscript.run = true

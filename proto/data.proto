@@ -1,0 +1,70 @@
+/*
+ * Minimal, wire-compatible subset of buck2's `app/buck2_data/data.proto`.
+ *
+ * test.proto references only `buck.data.CommandExecutionKind` (via
+ * `ExecutionResult2.execution_details.execution_kind`). The upstream data.proto
+ * is ~110KB and pulls in the entire buck2 event schema, none of which the test
+ * runner needs. prost decodes by field number and silently skips fields it does
+ * not know, so this faithful subset (matching the upstream field numbers and
+ * types for the fields we read) decodes the real message buck2 sends while
+ * keeping the generated code small and dependency-free.
+ *
+ * Field numbers/types mirror buck2 @ 3f054b09fb3ddf6e96c8c38f1f21e9420b4215f0:
+ *   app/buck2_data/data.proto (messages CommandExecutionKind, LocalCommand,
+ *   RemoteCommand, OmittedLocalCommand, WorkerInitCommand, WorkerCommand and
+ *   enum CacheHitType).
+ */
+
+syntax = "proto3";
+
+package buck.data;
+
+// A command that ran locally.
+message LocalCommand {
+  // (upstream fields 1=argv, 2=env omitted: skipped on decode)
+  string action_digest = 3;
+}
+
+// A command that ran locally, omitted from the record for brevity.
+message OmittedLocalCommand {
+  string action_digest = 1;
+}
+
+// A command used to initialize a local worker.
+message WorkerInitCommand {
+  // (upstream fields 1=argv, 2=env omitted)
+  reserved 1, 2;
+}
+
+// A command executed by a local worker.
+message WorkerCommand {
+  // (upstream fields 1=argv, 2=env, 4=fallback_exe omitted)
+  string action_digest = 3;
+}
+
+enum CacheHitType {
+  ACTION_CACHE = 0;
+  REMOTE_DEP_FILE_CACHE = 1;
+  EXECUTED = 2; // not a cache hit
+}
+
+// A command executed remotely (possibly served from the RE action cache).
+message RemoteCommand {
+  string action_digest = 1;
+  bool cache_hit = 2;
+  // (upstream field 3=queue_time, 4=details omitted)
+  CacheHitType cache_hit_type = 5;
+}
+
+// How a command was executed. The runner uses this to classify each test action
+// as a cache hit, remote execution, or local execution for its metrics and
+// historical-duration database.
+message CommandExecutionKind {
+  oneof command {
+    LocalCommand local_command = 1;
+    RemoteCommand remote_command = 2;
+    OmittedLocalCommand omitted_local_command = 3;
+    WorkerInitCommand worker_init_command = 4;
+    WorkerCommand worker_command = 5;
+  }
+}

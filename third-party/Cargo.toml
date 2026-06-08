@@ -1,0 +1,39 @@
+# Third-party dependency manifest for reindeer. `reindeer buckify` resolves this
+# (and its lockfile) into `third-party/BUCK`, emitting one `cargo.rust_library`
+# per crate plus `//third-party:<crate>` aliases the root BUCK deps point at.
+# Keep the versions/features in sync with the top-level Cargo.toml.
+[package]
+  name    = "quokka-third-party"
+  version = "0.0.0"
+  edition = "2024"
+
+[lib]
+  path = "lib.rs"
+
+[dependencies]
+  anyhow      = "1.0.100"
+  async-trait = "0.1.83"
+  clap        = { version = "4.4", features = ["derive"] }
+  futures     = "0.3.31"
+  hyper-util  = "0.1"
+  parking_lot = { version = "0.12.3", features = ["arc_lock"] }
+  prost       = "0.13"
+  prost-types = "0.13"
+  rustc-hash  = "2"
+  serde       = { version = "1.0", features = ["derive", "rc"] }
+  serde_json  = "1.0.134"
+  thiserror   = "2.0"
+  tonic       = "0.12"
+  tower       = { version = "0.4.13", features = ["full"] }
+  tracing     = { version = "0.1.41", features = ["std"] }
+  tokio = { version = "1.42.0", default-features = false, features = [
+    "net",
+    "rt-multi-thread",
+    "io-util",
+    "macros",
+    "rt",
+    "sync",
+    "time",
+  ] }
+
+[workspace]

@@ -1,0 +1,43 @@
+[cells]
+  root = .
+  prelude = prelude
+  toolchains = toolchains
+  none = none
+
+[cell_aliases]
+  config = prelude
+  ovr_config = prelude
+  fbcode = none
+  fbsource = none
+  fbcode_macros = none
+  buck = none
+
+# Use the prelude bundled inside the Buck2 binary, version-locked to the binary's
+# own build. There is no `.prelude` cell to materialize and no binary/prelude
+# skew to track. (Mirrors nobie's `[external_cells] prelude = bundled`.)
+[external_cells]
+  prelude = bundled
+
+[parser]
+  target_platform_detector_spec = target:root//...->prelude//platforms:default \
+    target:prelude//...->prelude//platforms:default \
+    target:toolchains//...->prelude//platforms:default
+
+[build]
+  execution_platforms = prelude//platforms:default
+
+[http]
+  # Third-party crates are fetched via `http_archive` from static.crates.io.
+  # Buck issues an `http_head` per archive to learn its size; generous timeouts
+  # plus a concurrency cap keep that fan-out survivable. (Mirrors nobie.)
+  connect_timeout_ms = 30000
+  read_timeout_ms = 60000
+  write_timeout_ms = 60000
+  max_concurrent_requests = 64
+
+[buck2]
+  digest_algorithms = SHA256
+  file_watcher = notify
+
+[project]
+  ignore = .jj, .git, target, buck-out, .direnv, .devenv

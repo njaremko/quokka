@@ -1,0 +1,5 @@
+# axum's API docs `include_str!` markdown from its src/docs/ tree; vendor it.
+extra_srcs = [
+    "README.md",
+    "src/docs/**/*.md",
+]

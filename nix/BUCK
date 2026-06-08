@@ -1,0 +1,62 @@
+load(":remote_flake.bzl", "remote_flake")
+
+# The flake sources. `remote_flake` copies this directory next to the per-binary
+# wrapper scripts it generates; each wrapper lazily `nix build`s
+# `packages.<system>.<pkg>.out` and execs the resolved /nix/store binary. This
+# is the same nix↔buck2 bridge nobie uses (see nix/remote_flake.bzl).
+filegroup(
+    name = "flake",
+    srcs = glob([
+        "flake.nix",
+        "flake.lock",
+        "*.nix",
+    ]),
+    visibility = ["PUBLIC"],
+)
+
+remote_flake.package(
+    name = "rustc",
+    binary = "rustc",
+    binaries = ["rustdoc"],
+    path = ":flake",
+    visibility = ["PUBLIC"],
+)
+
+remote_flake.package(
+    name = "clippy",
+    binary = "clippy-driver",
+    path = ":flake",
+    visibility = ["PUBLIC"],
+)
+
+remote_flake.package(
+    name = "clang",
+    binary = "clang",
+    binaries = ["clang++"],
+    path = ":flake",
+    visibility = ["PUBLIC"],
+)
+
+remote_flake.package(
+    name = "llvm",
+    binary = "llvm-ar",
+    binaries = [
+        "llvm-link",
+        "llvm-nm",
+        "llvm-objcopy",
+        "llvm-objdump",
+        "llvm-ranlib",
+        "llvm-strip",
+    ],
+    path = ":flake",
+    visibility = ["PUBLIC"],
+)
+
+remote_flake.output(
+    name = "libiconv",
+    path = ":flake",
+    sub_targets = {
+        "lib": "lib",
+    },
+    visibility = ["PUBLIC"],
+)

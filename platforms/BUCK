@@ -1,0 +1,34 @@
+constraint_setting(
+    name = "profile",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "dev",
+    constraint_setting = ":profile",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "debug",
+    constraint_setting = ":profile",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "dbg",
+    constraint_setting = ":profile",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "profiling",
+    constraint_setting = ":profile",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "release",
+    constraint_setting = ":profile",
+    visibility = ["PUBLIC"],
+)

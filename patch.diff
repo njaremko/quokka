@@ -1,0 +1,104 @@
+--- src/translator.rs
++++ src/translator.rs
+@@ -19,25 +19,20 @@
+ 
+ use std::sync::Arc;
+ 
+-/// The framework driving a target's tests.
+-#[derive(Clone)]
+-pub struct TranslatorInfo {
+-    pub declares_executor_overrides: bool,
+-    pub listing: ListingStrategy,
+-    pub parser: ResultParser,
+-    pub execution_args: Arc<dyn Fn(&[&str], IgnoredPolicy) -> Vec<String> + Send + Sync>,
++pub trait Translator: Send + Sync {
++    fn declares_executor_overrides(&self) -> bool;
++    fn parser_capability(&self) -> DemuxCapability;
++    fn listing_strategy(&self) -> ListingStrategy;
++    fn execution_args(&self, names: &[&str], ignored: IgnoredPolicy, user_args: &[String]) -> Vec<String>;
++    fn parse_results(&self, stdout: &[u8], stderr: &[u8]) -> FxHashMap<String, PerTestObservation>;
+ }
+ 
+ /// How a target's tests are discovered and fanned out.
+-#[derive(Clone)]
+ pub enum ListingStrategy {
+     /// List the target, then issue one (or one batched) execution per test.
+     PerTestListing {
+-        request_args: Arc<dyn Fn(IgnoredPolicy) -> Vec<String> + Send + Sync>,
+-        parse: Arc<dyn Fn(&[u8], IgnoredPolicy) -> Result<Vec<TestCase>, ListingParseError> + Send + Sync>,
++        request_args: Box<dyn Fn(IgnoredPolicy) -> Vec<String> + Send + Sync>,
++        parse: Box<dyn Fn(&[u8], IgnoredPolicy) -> Result<Vec<TestCase>, ListingParseError> + Send + Sync>,
+     },
+     /// No listing; one execution covers the whole target, reported under `name`.
+     WholeTarget { name: &'static str },
+@@ -50,53 +45,47 @@
+     NameAttributable,
+ }
+ 
+-#[derive(Clone)]
+-pub struct ResultParser {
+-    pub capability: DemuxCapability,
+-    pub decode: Arc<dyn Fn(&[u8], &[u8]) -> FxHashMap<String, PerTestObservation> + Send + Sync>,
++pub struct TranslatorRegistry {
++    factories: FxHashMap<String, Box<dyn Fn(&crate::cli::RunnerConfig) -> Box<dyn Translator> + Send + Sync>>,
+ }
+ 
+-impl TranslatorInfo {
+-    /// Resolve the translator from the provider `test_type`.
+-    pub fn resolve(test_type: &str, list_format: ListFormat, run_format: RunFormat) -> TranslatorInfo {
+-        match test_type {
+-            "rust_libtest_v1" | "rust" | "rust_nextest_v1" => TranslatorInfo {
+-                declares_executor_overrides: false,
+-                listing: ListingStrategy::PerTestListing {
+-                    request_args: Arc::new(move |ignored| libtest_listing_args(ignored, list_format)),
+-                    parse: Arc::new(move |stdout, ignored| parse_listing(list_format, stdout, ignored)),
+-                },
+-                parser: ResultParser {
+-                    capability: DemuxCapability::NameAttributable,
+-                    decode: Arc::new(move |stdout, stderr| libtest_decode(run_format, stdout, stderr)),
+-                },
+-                execution_args: Arc::new(move |names, ignored| libtest_execution_args(names, ignored, run_format)),
+-            },
+-            "rust_doctest_v1" => TranslatorInfo {
+-                declares_executor_overrides: false,
+-                listing: ListingStrategy::WholeTarget {
+-                    name: DOCTEST_RESULT_NAME,
+-                },
+-                parser: ResultParser {
+-                    // Doctests run entirely as a single target execution
+-                    capability: DemuxCapability::SingletonOnly,
+-                    decode: Arc::new(move |stdout, stderr| libtest_decode(run_format, stdout, stderr)),
+-                },
+-                execution_args: Arc::new(move |_names, ignored| doctest_execution_args(ignored, run_format)),
+-            },
+-            "custom_binary_v1" | _ => TranslatorInfo {
+-                declares_executor_overrides: true,
+-                listing: ListingStrategy::WholeBinary {
+-                    name: BINARY_RESULT_NAME,
+-                },
+-                parser: ResultParser {
+-                    capability: DemuxCapability::SingletonOnly,
+-                    decode: Arc::new(|_stdout, _stderr| custom_binary_decode()),
+-                },
+-                execution_args: Arc::new(|_names, _ignored| custom_binary_execution_args()),
+-            },
+-        }
++impl TranslatorRegistry {
++    pub fn new() -> Self {
++        Self {
++            factories: FxHashMap::default(),
++        }
++    }
++
++    pub fn register(
++        &mut self,
++        test_type: &str,
++        factory: impl Fn(&crate::cli::RunnerConfig) -> Box<dyn Translator> + Send + Sync + 'static,
++    ) {
++        self.factories.insert(test_type.to_owned(), Box::new(factory));
++    }
++
++    pub fn resolve(&self, test_type: &str, config: &crate::cli::RunnerConfig) -> Option<Box<dyn Translator>> {
++        self.factories.get(test_type).map(|f| f(config))
+     }
+ }

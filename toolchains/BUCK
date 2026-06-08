@@ -1,0 +1,209 @@
+load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
+load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "system_python_toolchain")
+load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
+load(":cxx.bzl", "quokka_nix_cxx_toolchain")
+load(":rust.bzl", "quokka_nix_rust_toolchain")
+
+# rustc/rustdoc/clippy-driver come from the nix flake via the `//nix` wrappers.
+RUSTC = "root//nix:rustc"
+RUSTDOC = "root//nix:rustc[rustdoc]"
+CLIPPY_DRIVER = "root//nix:clippy"
+
+# C/C++ compiler + binutils, also nix-provided.
+CLANG = "root//nix:clang"
+CLANGXX = "root//nix:clang[clang++]"
+AR = "root//nix:llvm"
+NM = "root//nix:llvm[llvm-nm]"
+OBJCOPY = "root//nix:llvm[llvm-objcopy]"
+OBJDUMP = "root//nix:llvm[llvm-objdump]"
+RANLIB = "root//nix:llvm[llvm-ranlib]"
+STRIP = "root//nix:llvm[llvm-strip]"
+LLVM_LINK = "root//nix:llvm[llvm-link]"
+
+# Host link flags. macOS rust binaries link against the system `iconv`, supplied
+# here from the nix `libiconv` output; linux uses lld. Each flag is threaded to
+# rustc as a `-C link-arg=...`.
+HOST_LINKER_RUSTC_FLAGS = select({
+    "prelude//os/constraints:macos": [
+        "-C",
+        "link-arg=-L$(location root//nix:libiconv[lib])",
+        "-C",
+        "link-arg=-Wl,-dead_strip_dylibs",
+    ],
+    "prelude//os/constraints:linux": [
+        "-C",
+        "link-arg=-fuse-ld=lld",
+    ],
+    "DEFAULT": [],
+})
+
+VIRTUAL_SOURCE_ROOT = "/workspace"
+
+PATH_REMAP_FLAGS = [
+    "-Zremap-cwd-prefix=" + VIRTUAL_SOURCE_ROOT,
+]
+
+CARGO_DEV_CODEGEN_UNIT_FLAGS = [
+    "-C",
+    "codegen-units=256",
+]
+
+DEV_RUSTC_FLAGS = [
+    "-C",
+    "opt-level=0",
+    "-C",
+    "lto=off",
+] + CARGO_DEV_CODEGEN_UNIT_FLAGS + [
+    "-C",
+    "strip=none",
+    "-C",
+    "debuginfo=0",
+    "-C",
+    "embed-bitcode=no",
+] + PATH_REMAP_FLAGS
+
+DEBUG_RUSTC_FLAGS = [
+    "-C",
+    "opt-level=0",
+    "-C",
+    "lto=off",
+] + CARGO_DEV_CODEGEN_UNIT_FLAGS + [
+    "-C",
+    "strip=none",
+    "-C",
+    "debuginfo=2",
+    "-C",
+    "embed-bitcode=no",
+    "-C",
+    "split-debuginfo=unpacked",
+] + PATH_REMAP_FLAGS
+
+PROFILING_RUSTC_FLAGS = [
+    "-C",
+    "opt-level=2",
+    "-C",
+    "lto=off",
+] + CARGO_DEV_CODEGEN_UNIT_FLAGS + [
+    "-C",
+    "strip=none",
+    "-C",
+    "debuginfo=2",
+    "-C",
+    "embed-bitcode=no",
+] + PATH_REMAP_FLAGS
+
+RELEASE_RUSTC_FLAGS = [
+    "-C",
+    "opt-level=3",
+    "-C",
+    "lto=off",
+    "-C",
+    "codegen-units=1",
+    "-C",
+    "strip=symbols",
+    "-C",
+    "debuginfo=0",
+    "-C",
+    "embed-bitcode=no",
+    "-C",
+    "target-feature=+crt-static",
+] + PATH_REMAP_FLAGS
+
+PROFILE_RUSTC_FLAGS = select({
+    "root//platforms:debug": DEBUG_RUSTC_FLAGS,
+    "root//platforms:dbg": DEBUG_RUSTC_FLAGS,
+    "root//platforms:profiling": PROFILING_RUSTC_FLAGS,
+    "root//platforms:release": RELEASE_RUSTC_FLAGS,
+    "DEFAULT": DEV_RUSTC_FLAGS,
+})
+
+# Lint policy mirrored from Cargo.toml `[lints]`. These reach plain rustc and
+# clippy-driver alike. The four clippy default-group allows come FIRST so the
+# curated per-lint `--warn` flags below win (left-to-right, more-specific wins);
+# `clippy::correctness` is intentionally left at its deny-by-default level.
+WORKSPACE_LINT_RUSTC_FLAGS = [
+    # [lints.rust]
+    "--warn=private_interfaces",
+    "--warn=redundant_imports",
+    "--allow=unexpected_cfgs",
+    "--deny=unsafe_code",
+    "--warn=unused_imports",
+    "--warn=unused_must_use",
+    # Suppress clippy's default-on stylistic groups (keep correctness).
+    "--allow=clippy::style",
+    "--allow=clippy::complexity",
+    "--allow=clippy::perf",
+    "--allow=clippy::suspicious",
+    # [lints.clippy]
+    "--allow=clippy::collapsible_if",
+    "--warn=clippy::enum_glob_use",
+    "--warn=clippy::or_fun_call",
+    "--allow=clippy::result_large_err",
+    "--allow=clippy::single_match",
+    "--warn=clippy::string_slice",
+    "--allow=clippy::to_string_trait_impl",
+    "--warn=clippy::unused_async",
+    "--warn=clippy::unwrap_used",
+]
+
+system_genrule_toolchain(
+    name = "genrule",
+    visibility = ["PUBLIC"],
+)
+
+noop_test_toolchain(
+    name = "test",
+    visibility = ["PUBLIC"],
+)
+
+# `buck2 test` reads this for the RE profile registry. Tests run locally here
+# (no RE endpoint configured), but the rust_test rules require the target to
+# exist.
+remote_test_execution_toolchain(
+    name = "remote_test_execution",
+    profiles = {
+        "remote": {
+            "capabilities": {},
+            "remote_cache_enabled": True,
+            "use_case": "buck2-default",
+        },
+    },
+    visibility = ["PUBLIC"],
+)
+
+system_python_bootstrap_toolchain(
+    name = "python_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+system_python_toolchain(
+    name = "python",
+    visibility = ["PUBLIC"],
+)
+
+quokka_nix_rust_toolchain(
+    name = "rust",
+    clippy_driver = CLIPPY_DRIVER,
+    compiler = RUSTC,
+    default_edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS + HOST_LINKER_RUSTC_FLAGS + PROFILE_RUSTC_FLAGS,
+    rustdoc = RUSTDOC,
+    visibility = ["PUBLIC"],
+)
+
+quokka_nix_cxx_toolchain(
+    name = "cxx",
+    archiver = AR,
+    assembler = CLANG,
+    compiler = CLANG,
+    cxx_compiler = CLANGXX,
+    linker = CLANGXX,
+    llvm_link = LLVM_LINK,
+    nm = NM,
+    objcopy = OBJCOPY,
+    objdump = OBJDUMP,
+    ranlib = RANLIB,
+    strip = STRIP,
+    visibility = ["PUBLIC"],
+)

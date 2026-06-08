@@ -1,0 +1,75 @@
+[package]
+  name        = "quokka"
+  version     = "0.1.0"
+  edition     = "2024"
+  description = "A TPX-style external test runner for Buck2, specialized for Rust tests."
+  license     = "MIT OR Apache-2.0"
+
+[[bin]]
+  name = "quokka"
+  path = "src/main.rs"
+
+[lib]
+  name = "quokka"
+  path = "src/lib.rs"
+
+[dependencies]
+  anyhow       = "1.0.100"
+  async-trait  = "0.1.83"
+  clap         = { version = "4.4", features = ["derive"] }
+  futures      = "0.3.31"
+  hyper-util   = "0.1"
+  parking_lot  = { version = "0.12.3", features = ["arc_lock"] }
+  prost        = "0.13"
+  prost-types  = "0.13"
+  rustc-hash   = "2"
+  serde        = { version = "1.0", features = ["derive", "rc"] }
+  serde_json   = "1.0.134"
+  thiserror    = "2.0"
+  tonic        = "0.12"
+  tower        = { version = "0.4.13", features = ["full"] }
+  tracing      = { version = "0.1.41", features = ["std"] }
+  # `net` for Unix/TCP sockets to the buck2 daemon; `rt-multi-thread` so the
+  # scheduler can drive thousands of concurrent Execute2 calls across cores.
+  tokio = { version = "1.42.0", default-features = false, features = [
+    "net",
+    "rt-multi-thread",
+    "io-util",
+    "macros",
+    "rt",
+    "sync",
+    "time",
+  ] }
+
+[dev-dependencies]
+  tokio = { version = "1.42.0", default-features = false, features = [
+    "net",
+    "rt-multi-thread",
+    "io-util",
+    "macros",
+    "rt",
+    "sync",
+    "time",
+  ] }
+
+[profile.release]
+  strip = "symbols"
+
+[lints.clippy]
+  collapsible_if       = "allow" # fix involving let not stable yet
+  enum_glob_use        = "warn"
+  or_fun_call          = "warn"
+  result_large_err     = "allow"
+  single_match         = "allow"
+  string_slice         = "warn"  # Warn on string slicing to prevent UTF-8 boundary issues
+  to_string_trait_impl = "allow"
+  unused_async         = "warn"
+  unwrap_used          = "warn"
+
+[lints.rust]
+  private_interfaces = "warn"
+  redundant_imports  = "warn"
+  unexpected_cfgs    = { level = "warn", check-cfg = ['cfg(rust_analyzer)'] }
+  unsafe_code        = "deny"
+  unused_imports     = "warn"
+  unused_must_use    = "warn"

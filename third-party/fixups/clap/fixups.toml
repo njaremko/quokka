@@ -1,0 +1,7 @@
+# clap's lib docs `include_str!` its README plus the whole examples/ tree
+# (tutorials referenced from doc comments). Vendor them as sources.
+extra_srcs = [
+    "README.md",
+    "examples/**/*.md",
+    "examples/**/*.rs",
+]

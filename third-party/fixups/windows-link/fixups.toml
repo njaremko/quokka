@@ -1,0 +1,2 @@
+# Doc attribute `include_str!("../readme.md")`; vendor the file as a source.
+extra_srcs = ["readme.md"]
