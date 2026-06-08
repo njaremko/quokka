@@ -221,6 +221,31 @@ fn duration_from_proto(d: prost_types::Duration) -> Duration {
     Duration::new(secs, nanos)
 }
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+fn find_project_dir() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join(".buckconfig").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    std::env::current_dir().ok()
+}
+
+pub(crate) fn project_dir_key() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let path = find_project_dir().unwrap_or_else(|| PathBuf::from("."));
+        let path = path.canonicalize().unwrap_or(path);
+        path.to_string_lossy().into_owned()
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TestIdentity {
     pub target: String,
@@ -230,7 +255,8 @@ pub struct TestIdentity {
 
 impl TestIdentity {
     pub(crate) fn to_db_key(&self) -> String {
-        let mut key = format!("{}\u{1}{}", self.target, self.name);
+        let proj = project_dir_key();
+        let mut key = format!("{}\u{2}{}\u{1}{}", proj, self.target, self.name);
         if let Some(v) = self.variant.identity() {
             key.push('#');
             key.push_str(&v);
@@ -318,6 +344,19 @@ pub fn failure_class(status: TestVerdict) -> Option<FailureClass> {
 mod tests {
     use super::*;
     use std::num::NonZeroU32;
+
+    #[test]
+    fn test_to_db_key_contains_project_dir_and_separator() {
+        let base_id = TestIdentity { target: "m".into(), name: "t".into(), variant: Variant::Default };
+        let key = base_id.to_db_key();
+        let proj = project_dir_key();
+        assert!(!proj.is_empty(), "Project directory key should not be empty");
+        assert!(key.starts_with(proj), "Key should start with project directory");
+        assert!(key.contains('\u{2}'), "Key should contain the separator u2");
+        assert!(key.contains('\u{1}'), "Key should contain the separator u1");
+        let expected = format!("{}\u{2}m\u{1}t", proj);
+        assert_eq!(key, expected);
+    }
 
     #[test]
     fn result_identity_is_unique_across_axes() {

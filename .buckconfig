@@ -26,6 +26,9 @@
 [build]
   execution_platforms = prelude//platforms:default
 
+[test]
+  v2_test_executor = quokka  
+
 [http]
   # Third-party crates are fetched via `http_archive` from static.crates.io.
   # Buck issues an `http_head` per archive to learn its size; generous timeouts

@@ -47,7 +47,6 @@ def _quokka_nix_rust_toolchain_impl(ctx):
             rustdoc = ctx.attrs.rustdoc[RunInfo],
             rustdoc_env = ctx.attrs.rustdoc_env,
             rustdoc_flags = ctx.attrs.rustdoc_flags,
-            restricted_rustc_flags = ctx.attrs.restricted_rustc_flags,
             warn_lints = ctx.attrs.warn_lints,
         ),
     ]

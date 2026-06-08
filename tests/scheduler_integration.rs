@@ -584,17 +584,25 @@ async fn flake_db_records_each_fresh_attempt_not_just_the_folded_best() {
 
     drive_to_completion(orch, intake_rx, config, test_context()).await;
 
-    let flake = std::fs::read_to_string(dir.join("flake.json")).expect("flake.json written");
-    // The flaky test ran twice (fail then pass): both fresh attempts recorded.
-    assert!(
-        flake.contains(r#""runs":2,"failures":1"#),
-        "flaky test should record 2 runs / 1 failure, got: {flake}"
-    );
-    // The steady test ran once and passed.
-    assert!(
-        flake.contains(r#""runs":1,"failures":0"#),
-        "steady test should record 1 run / 0 failures, got: {flake}"
-    );
+    let db = quokka::duration_db::DurationDb::load(dir.clone());
+    let flaky_id = quokka::result::TestIdentity {
+        target: "root//rust/foo:foo".into(),
+        name: "flaky".into(),
+        variant: quokka::variant::Variant::Default,
+    };
+    let steady_id = quokka::result::TestIdentity {
+        target: "root//rust/foo:foo".into(),
+        name: "steady".into(),
+        variant: quokka::variant::Variant::Default,
+    };
+
+    let flaky_flake = db.flake(None, &flaky_id).unwrap();
+    assert_eq!(flaky_flake.runs, 2, "flaky test should record 2 runs");
+    assert_eq!(flaky_flake.failures, 1, "flaky test should record 1 failure");
+
+    let steady_flake = db.flake(None, &steady_id).unwrap();
+    assert_eq!(steady_flake.runs, 1, "steady test should record 1 run");
+    assert_eq!(steady_flake.failures, 0, "steady test should record 0 failures");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

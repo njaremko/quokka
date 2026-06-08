@@ -12,7 +12,6 @@ load(
     "LinkerType",
     "PicBehavior",
     "RcCompilerInfo",
-    "RuntimeDependencyHandling",
     "ShlibInterfacesMode",
 )
 load("@prelude//cxx:headers.bzl", "HeaderMode")
@@ -145,7 +144,6 @@ def _quokka_nix_cxx_toolchain_impl(ctx):
             pic_behavior = pic_behavior,
             llvm_link = ctx.attrs.llvm_link[RunInfo] if ctx.attrs.llvm_link else None,
             use_dep_files = True,
-            runtime_dependency_handling = RuntimeDependencyHandling("no_symlink"),
         ),
         CxxPlatformInfo(name = target_name),
     ]

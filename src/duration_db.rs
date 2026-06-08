@@ -1,28 +1,29 @@
-//! The historical-duration / flake metadata store.
-//!
-//! Strictly **advisory**: it informs longest-first ordering, timeout selection,
-//! micro-batching, CI sharding and failure-prediction display. It is NEVER used
-//! to skip a test. It is loaded once at startup and flushed once at shutdown.
-//!
-//! Perf data (durations) and policy-affecting data (flake counts, last failure
-//! class) are kept in separate files so a change to one cannot corrupt the
-//! other.
-
-use std::collections::BTreeMap;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::hash::{Hash, Hasher};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use serde::{Deserialize, Serialize};
 
 use crate::result::{FailureClass, TestIdentity};
 
 /// Max recent samples retained per test for percentile estimation.
 const MAX_SAMPLES: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Environment {
     Local,
     Remote,
+}
+
+impl Environment {
+    const ALL: [Self; 2] = [Environment::Local, Environment::Remote];
+
+    fn to_index(self) -> usize {
+        match self {
+            Environment::Local => 0,
+            Environment::Remote => 1,
+        }
+    }
 }
 
 /// A test's duration estimate. `Unseen` (no history) is a named state, not a
@@ -49,13 +50,13 @@ impl DurationEstimate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DurationSample {
     pub timestamp_ms: u64,
     pub duration_ms: u64,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone)]
 pub struct PerfRecord {
     pub samples: Vec<DurationSample>,
 }
@@ -81,7 +82,7 @@ impl PerfRecord {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone)]
 pub struct FlakeRecord {
     pub runs: u64,
     pub failures: u64,
@@ -113,29 +114,115 @@ impl FlakeRecord {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct PerfFile {
-    env_tests: BTreeMap<Environment, BTreeMap<String, PerfRecord>>,
+fn failure_class_to_u8(class: FailureClass) -> u8 {
+    match class {
+        FailureClass::Fail => 1,
+        FailureClass::Fatal => 2,
+        FailureClass::Timeout => 3,
+        FailureClass::Infra => 4,
+    }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct FlakeFile {
-    env_tests: BTreeMap<Environment, BTreeMap<String, FlakeRecord>>,
+fn failure_class_from_u8(val: u8) -> Option<FailureClass> {
+    match val {
+        1 => Some(FailureClass::Fail),
+        2 => Some(FailureClass::Fatal),
+        3 => Some(FailureClass::Timeout),
+        4 => Some(FailureClass::Infra),
+        _ => None,
+    }
+}
+
+fn hash_key(test_id: &TestIdentity) -> u64 {
+    let mut hasher = FxHasher::default();
+    crate::result::project_dir_key().hash(&mut hasher);
+    test_id.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The loaded metadata store plus in-memory accumulators for this run.
 pub struct DurationDb {
     dir: PathBuf,
-    perf: PerfFile,
-    flake: FlakeFile,
+    perf: [FxHashMap<u64, PerfRecord>; 2],
+    flake: [FxHashMap<u64, FlakeRecord>; 2],
 }
 
 impl DurationDb {
     /// Load the store from `dir` (creating empty state if absent or corrupt —
     /// advisory data, so a parse failure starts fresh rather than aborting).
     pub fn load(dir: PathBuf) -> Self {
-        let perf = read_json(&dir.join("perf.json")).unwrap_or_default();
-        let flake = read_json(&dir.join("flake.json")).unwrap_or_default();
+        let mut perf = [FxHashMap::default(), FxHashMap::default()];
+        let mut flake = [FxHashMap::default(), FxHashMap::default()];
+
+        if let Ok(file) = std::fs::File::open(dir.join("perf.bin")) {
+            let mut reader = BufReader::new(file);
+            let mut magic = [0u8; 4];
+            if reader.read_exact(&mut magic).is_ok() && &magic == b"PRF1" {
+                for i in 0..2 {
+                    let mut len_buf = [0u8; 4];
+                    if reader.read_exact(&mut len_buf).is_ok() {
+                        let len = u32::from_le_bytes(len_buf);
+                        perf[i].reserve((len as usize).min(1_000_000));
+                        for _ in 0..len {
+                            let mut k_buf = [0u8; 8];
+                            let mut samples_len = [0u8; 1];
+                            if reader.read_exact(&mut k_buf).is_ok() && reader.read_exact(&mut samples_len).is_ok() {
+                                let k = u64::from_le_bytes(k_buf);
+                                let s_len = samples_len[0];
+                                let mut samples = Vec::with_capacity(s_len as usize);
+                                for _ in 0..s_len {
+                                    let mut ts_buf = [0u8; 8];
+                                    let mut dur_buf = [0u8; 8];
+                                    if reader.read_exact(&mut ts_buf).is_ok() && reader.read_exact(&mut dur_buf).is_ok() {
+                                        samples.push(DurationSample {
+                                            timestamp_ms: u64::from_le_bytes(ts_buf),
+                                            duration_ms: u64::from_le_bytes(dur_buf),
+                                        });
+                                    }
+                                }
+                                perf[i].insert(k, PerfRecord { samples });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(file) = std::fs::File::open(dir.join("flake.bin")) {
+            let mut reader = BufReader::new(file);
+            let mut magic = [0u8; 4];
+            if reader.read_exact(&mut magic).is_ok() && &magic == b"FLK1" {
+                for i in 0..2 {
+                    let mut len_buf = [0u8; 4];
+                    if reader.read_exact(&mut len_buf).is_ok() {
+                        let len = u32::from_le_bytes(len_buf);
+                        flake[i].reserve((len as usize).min(1_000_000));
+                        for _ in 0..len {
+                            let mut k_buf = [0u8; 8];
+                            let mut runs_buf = [0u8; 8];
+                            let mut fail_buf = [0u8; 8];
+                            let mut ts_buf = [0u8; 8];
+                            let mut class_buf = [0u8; 1];
+                            if reader.read_exact(&mut k_buf).is_ok() &&
+                               reader.read_exact(&mut runs_buf).is_ok() &&
+                               reader.read_exact(&mut fail_buf).is_ok() &&
+                               reader.read_exact(&mut ts_buf).is_ok() &&
+                               reader.read_exact(&mut class_buf).is_ok() {
+                                let k = u64::from_le_bytes(k_buf);
+                                let ts = u64::from_le_bytes(ts_buf);
+                                flake[i].insert(k, FlakeRecord {
+                                    runs: u64::from_le_bytes(runs_buf),
+                                    failures: u64::from_le_bytes(fail_buf),
+                                    last_failure_timestamp_ms: if ts == u64::MAX { None } else { Some(ts) },
+                                    last_failure_class: failure_class_from_u8(class_buf[0]),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Self { dir, perf, flake }
     }
 
@@ -143,23 +230,23 @@ impl DurationDb {
     pub fn ephemeral() -> Self {
         Self {
             dir: PathBuf::new(),
-            perf: PerfFile::default(),
-            flake: FlakeFile::default(),
+            perf: [FxHashMap::default(), FxHashMap::default()],
+            flake: [FxHashMap::default(), FxHashMap::default()],
         }
     }
 
     /// The duration estimate for a test. If environment is known, queries it,
     /// otherwise aggregates across environments.
     pub fn estimate(&self, env: Option<Environment>, test_id: &TestIdentity) -> DurationEstimate {
-        let key = test_id.to_db_key();
+        let key = hash_key(test_id);
         let mut combined = PerfRecord::default();
         if let Some(e) = env {
-            if let Some(record) = self.perf.env_tests.get(&e).and_then(|t| t.get(&key)) {
+            if let Some(record) = self.perf[e.to_index()].get(&key) {
                 combined.combine(record);
             }
         } else {
-            for tests in self.perf.env_tests.values() {
-                if let Some(record) = tests.get(&key) {
+            for e in Environment::ALL {
+                if let Some(record) = self.perf[e.to_index()].get(&key) {
                     combined.combine(record);
                 }
             }
@@ -177,18 +264,18 @@ impl DurationDb {
 
     /// The flake record for a test. Aggregates across environments if env is None.
     pub fn flake(&self, env: Option<Environment>, test_id: &TestIdentity) -> Option<FlakeRecord> {
-        let key = test_id.to_db_key();
+        let key = hash_key(test_id);
         let mut combined = FlakeRecord::default();
         let mut found = false;
 
         if let Some(e) = env {
-            if let Some(record) = self.flake.env_tests.get(&e).and_then(|t| t.get(&key)) {
+            if let Some(record) = self.flake[e.to_index()].get(&key) {
                 combined.combine(record);
                 found = true;
             }
         } else {
-            for tests in self.flake.env_tests.values() {
-                if let Some(record) = tests.get(&key) {
+            for e in Environment::ALL {
+                if let Some(record) = self.flake[e.to_index()].get(&key) {
                     combined.combine(record);
                     found = true;
                 }
@@ -226,38 +313,24 @@ impl DurationDb {
         failure_class: Option<FailureClass>,
         timestamp_ms: u64,
     ) {
-        let key = test_id.to_db_key();
+        let key = hash_key(test_id);
         if !failed {
-            let perf = self
-                .perf
-                .env_tests
-                .entry(env)
-                .or_default()
-                .entry(key.clone())
-                .or_default();
+            let perf = self.perf[env.to_index()].entry(key).or_default();
             perf.record(timestamp_ms, duration.as_millis() as u64);
         }
-        let flake = self
-            .flake
-            .env_tests
-            .entry(env)
-            .or_default()
-            .entry(key)
-            .or_default();
+        let flake = self.flake[env.to_index()].entry(key).or_default();
         flake.record(failed, failure_class, timestamp_ms);
     }
 
     pub fn combine(&mut self, other: Self) {
-        for (env, tests) in other.perf.env_tests {
-            let self_tests = self.perf.env_tests.entry(env).or_default();
+        for (i, tests) in other.perf.into_iter().enumerate() {
             for (k, v) in tests {
-                self_tests.entry(k).or_default().combine(&v);
+                self.perf[i].entry(k).or_default().combine(&v);
             }
         }
-        for (env, tests) in other.flake.env_tests {
-            let self_tests = self.flake.env_tests.entry(env).or_default();
+        for (i, tests) in other.flake.into_iter().enumerate() {
             for (k, v) in tests {
-                self_tests.entry(k).or_default().combine(&v);
+                self.flake[i].entry(k).or_default().combine(&v);
             }
         }
     }
@@ -268,23 +341,56 @@ impl DurationDb {
             return Ok(());
         }
         std::fs::create_dir_all(&self.dir)?;
-        write_json_atomic(&self.dir.join("perf.json"), &self.perf)?;
-        write_json_atomic(&self.dir.join("flake.json"), &self.flake)?;
+
+        let write_perf = || -> std::io::Result<()> {
+            let path = self.dir.join("perf.bin");
+            let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+            {
+                let file = std::fs::File::create(&tmp)?;
+                let mut writer = BufWriter::new(file);
+                writer.write_all(b"PRF1")?;
+                for env_map in &self.perf {
+                    writer.write_all(&(env_map.len() as u32).to_le_bytes())?;
+                    for (k, v) in env_map {
+                        writer.write_all(&k.to_le_bytes())?;
+                        writer.write_all(&[v.samples.len() as u8])?;
+                        for s in &v.samples {
+                            writer.write_all(&s.timestamp_ms.to_le_bytes())?;
+                            writer.write_all(&s.duration_ms.to_le_bytes())?;
+                        }
+                    }
+                }
+                writer.flush()?;
+            }
+            std::fs::rename(&tmp, &path)
+        };
+        let _ = write_perf();
+
+        let write_flake = || -> std::io::Result<()> {
+            let path = self.dir.join("flake.bin");
+            let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+            {
+                let file = std::fs::File::create(&tmp)?;
+                let mut writer = BufWriter::new(file);
+                writer.write_all(b"FLK1")?;
+                for env_map in &self.flake {
+                    writer.write_all(&(env_map.len() as u32).to_le_bytes())?;
+                    for (k, v) in env_map {
+                        writer.write_all(&k.to_le_bytes())?;
+                        writer.write_all(&v.runs.to_le_bytes())?;
+                        writer.write_all(&v.failures.to_le_bytes())?;
+                        writer.write_all(&v.last_failure_timestamp_ms.unwrap_or(u64::MAX).to_le_bytes())?;
+                        writer.write_all(&[v.last_failure_class.map(failure_class_to_u8).unwrap_or(0)])?;
+                    }
+                }
+                writer.flush()?;
+            }
+            std::fs::rename(&tmp, &path)
+        };
+        let _ = write_flake();
+
         Ok(())
     }
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    // Include PID in tmp file name to prevent collision across concurrent processes.
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
 }
 
 /// Nearest-rank percentile (`p` in 0..=100) over unsorted samples.

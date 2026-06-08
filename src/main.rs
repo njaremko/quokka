@@ -21,9 +21,13 @@ use quokka::run::run;
 /// `.tmp` tree. Returns `None` only if the executable path is unavailable, in
 /// which case the DB stays ephemeral.
 fn default_duration_db() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("quokka-db")))
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home.join(".quokka"))
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("quokka-db")))
+    }
 }
 
 fn main() -> ExitCode {
