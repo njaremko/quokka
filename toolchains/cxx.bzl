@@ -12,6 +12,7 @@ load(
     "LinkerType",
     "PicBehavior",
     "RcCompilerInfo",
+    "RuntimeDependencyHandling",
     "ShlibInterfacesMode",
 )
 load("@prelude//cxx:headers.bzl", "HeaderMode")
@@ -61,6 +62,7 @@ def _quokka_nix_cxx_toolchain_impl(ctx):
     return [
         DefaultInfo(),
         CxxToolchainInfo(
+            runtime_dependency_handling = RuntimeDependencyHandling("no_symlink"),
             internal_tools = ctx.attrs.internal_tools[CxxInternalTools],
             linker_info = LinkerInfo(
                 linker = ctx.attrs.linker[RunInfo],
