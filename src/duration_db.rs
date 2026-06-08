@@ -145,6 +145,8 @@ pub struct DurationDb {
     dir: PathBuf,
     perf: [FxHashMap<u64, PerfRecord>; 2],
     flake: [FxHashMap<u64, FlakeRecord>; 2],
+    new_perf_samples: Vec<(Environment, u64, u64, u64)>, // env, key, timestamp, duration
+    new_flake_records: Vec<(Environment, u64, bool, Option<FailureClass>, u64)>, // env, key, failed, class, timestamp
 }
 
 impl DurationDb {
@@ -188,6 +190,23 @@ impl DurationDb {
             }
         }
 
+        if let Ok(mut file) = std::fs::File::open(dir.join("perf.log")) {
+            let mut buf = Vec::new();
+            if file.read_to_end(&mut buf).is_ok() {
+                let mut i = 0;
+                while i + 25 <= buf.len() {
+                    let env_idx = buf[i] as usize;
+                    let k = u64::from_le_bytes(buf[i+1..i+9].try_into().unwrap());
+                    let ts = u64::from_le_bytes(buf[i+9..i+17].try_into().unwrap());
+                    let dur = u64::from_le_bytes(buf[i+17..i+25].try_into().unwrap());
+                    if env_idx < 2 {
+                        perf[env_idx].entry(k).or_default().record(ts, dur);
+                    }
+                    i += 25;
+                }
+            }
+        }
+
         if let Ok(file) = std::fs::File::open(dir.join("flake.bin")) {
             let mut reader = BufReader::new(file);
             let mut magic = [0u8; 4];
@@ -223,7 +242,31 @@ impl DurationDb {
             }
         }
 
-        Self { dir, perf, flake }
+        if let Ok(mut file) = std::fs::File::open(dir.join("flake.log")) {
+            let mut buf = Vec::new();
+            if file.read_to_end(&mut buf).is_ok() {
+                let mut i = 0;
+                while i + 19 <= buf.len() {
+                    let env_idx = buf[i] as usize;
+                    let k = u64::from_le_bytes(buf[i+1..i+9].try_into().unwrap());
+                    let failed = buf[i+9] != 0;
+                    let class = failure_class_from_u8(buf[i+10]);
+                    let ts = u64::from_le_bytes(buf[i+11..i+19].try_into().unwrap());
+                    if env_idx < 2 {
+                        flake[env_idx].entry(k).or_default().record(failed, class, ts);
+                    }
+                    i += 19;
+                }
+            }
+        }
+
+        Self {
+            dir,
+            perf,
+            flake,
+            new_perf_samples: Vec::new(),
+            new_flake_records: Vec::new(),
+        }
     }
 
     /// An empty in-memory store that never persists.
@@ -232,6 +275,8 @@ impl DurationDb {
             dir: PathBuf::new(),
             perf: [FxHashMap::default(), FxHashMap::default()],
             flake: [FxHashMap::default(), FxHashMap::default()],
+            new_perf_samples: Vec::new(),
+            new_flake_records: Vec::new(),
         }
     }
 
@@ -317,12 +362,14 @@ impl DurationDb {
         if !failed {
             let perf = self.perf[env.to_index()].entry(key).or_default();
             perf.record(timestamp_ms, duration.as_millis() as u64);
+            self.new_perf_samples.push((env, key, timestamp_ms, duration.as_millis() as u64));
         }
         let flake = self.flake[env.to_index()].entry(key).or_default();
         flake.record(failed, failure_class, timestamp_ms);
+        self.new_flake_records.push((env, key, failed, failure_class, timestamp_ms));
     }
 
-    pub fn combine(&mut self, other: Self) {
+    pub fn combine(&mut self, mut other: Self) {
         for (i, tests) in other.perf.into_iter().enumerate() {
             for (k, v) in tests {
                 self.perf[i].entry(k).or_default().combine(&v);
@@ -333,61 +380,130 @@ impl DurationDb {
                 self.flake[i].entry(k).or_default().combine(&v);
             }
         }
+        self.new_perf_samples.append(&mut other.new_perf_samples);
+        self.new_flake_records.append(&mut other.new_flake_records);
     }
 
     /// Persist accumulated state (no-op for an ephemeral store). Best-effort.
-    pub fn flush(&self) -> std::io::Result<()> {
+    pub fn flush(&mut self) -> std::io::Result<()> {
         if self.dir.as_os_str().is_empty() {
             return Ok(());
         }
         std::fs::create_dir_all(&self.dir)?;
 
-        let write_perf = || -> std::io::Result<()> {
-            let path = self.dir.join("perf.bin");
-            let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-            {
-                let file = std::fs::File::create(&tmp)?;
-                let mut writer = BufWriter::new(file);
-                writer.write_all(b"PRF1")?;
-                for env_map in &self.perf {
-                    writer.write_all(&(env_map.len() as u32).to_le_bytes())?;
-                    for (k, v) in env_map {
-                        writer.write_all(&k.to_le_bytes())?;
-                        writer.write_all(&[v.samples.len() as u8])?;
-                        for s in &v.samples {
-                            writer.write_all(&s.timestamp_ms.to_le_bytes())?;
-                            writer.write_all(&s.duration_ms.to_le_bytes())?;
+        let lock_path = self.dir.join("db.lock");
+        let mut lock_acquired = false;
+        for _ in 0..200 {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+                Ok(_) => { lock_acquired = true; break; }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Ok(meta) = std::fs::metadata(&lock_path) {
+                        if let Ok(mod_time) = meta.modified() {
+                            if mod_time.elapsed().unwrap_or(Duration::ZERO) > Duration::from_secs(10) {
+                                let _ = std::fs::remove_file(&lock_path);
+                            }
                         }
                     }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                writer.flush()?;
+                Err(_) => break,
             }
-            std::fs::rename(&tmp, &path)
-        };
-        let _ = write_perf();
+        }
 
-        let write_flake = || -> std::io::Result<()> {
-            let path = self.dir.join("flake.bin");
-            let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-            {
-                let file = std::fs::File::create(&tmp)?;
-                let mut writer = BufWriter::new(file);
-                writer.write_all(b"FLK1")?;
-                for env_map in &self.flake {
-                    writer.write_all(&(env_map.len() as u32).to_le_bytes())?;
-                    for (k, v) in env_map {
-                        writer.write_all(&k.to_le_bytes())?;
-                        writer.write_all(&v.runs.to_le_bytes())?;
-                        writer.write_all(&v.failures.to_le_bytes())?;
-                        writer.write_all(&v.last_failure_timestamp_ms.unwrap_or(u64::MAX).to_le_bytes())?;
-                        writer.write_all(&[v.last_failure_class.map(failure_class_to_u8).unwrap_or(0)])?;
-                    }
+        let perf_log_path = self.dir.join("perf.log");
+        if !self.new_perf_samples.is_empty() {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&perf_log_path) {
+                let mut buf = Vec::with_capacity(self.new_perf_samples.len() * 25);
+                for (env, key, ts, dur) in &self.new_perf_samples {
+                    buf.push(env.to_index() as u8);
+                    buf.extend_from_slice(&key.to_le_bytes());
+                    buf.extend_from_slice(&ts.to_le_bytes());
+                    buf.extend_from_slice(&dur.to_le_bytes());
                 }
-                writer.flush()?;
+                let _ = file.write_all(&buf);
+                let _ = file.sync_data();
             }
-            std::fs::rename(&tmp, &path)
-        };
-        let _ = write_flake();
+            self.new_perf_samples.clear();
+        }
+
+        let flake_log_path = self.dir.join("flake.log");
+        if !self.new_flake_records.is_empty() {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&flake_log_path) {
+                let mut buf = Vec::with_capacity(self.new_flake_records.len() * 19);
+                for (env, key, failed, class, ts) in &self.new_flake_records {
+                    buf.push(env.to_index() as u8);
+                    buf.extend_from_slice(&key.to_le_bytes());
+                    buf.push(*failed as u8);
+                    buf.push(class.map(failure_class_to_u8).unwrap_or(0));
+                    buf.extend_from_slice(&ts.to_le_bytes());
+                }
+                let _ = file.write_all(&buf);
+                let _ = file.sync_data();
+            }
+            self.new_flake_records.clear();
+        }
+
+        let perf_size = std::fs::metadata(&perf_log_path).map(|m| m.len()).unwrap_or(0);
+        let flake_size = std::fs::metadata(&flake_log_path).map(|m| m.len()).unwrap_or(0);
+
+        if perf_size > 512 * 1024 || flake_size > 512 * 1024 {
+            let db_disk = Self::load(self.dir.clone());
+
+            let write_perf = || -> std::io::Result<()> {
+                let path = self.dir.join("perf.bin");
+                let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+                {
+                    let file = std::fs::File::create(&tmp)?;
+                    let mut writer = BufWriter::new(file);
+                    writer.write_all(b"PRF1")?;
+                    for env_map in &db_disk.perf {
+                        writer.write_all(&(env_map.len() as u32).to_le_bytes())?;
+                        for (k, v) in env_map {
+                            writer.write_all(&k.to_le_bytes())?;
+                            writer.write_all(&[v.samples.len() as u8])?;
+                            for s in &v.samples {
+                                writer.write_all(&s.timestamp_ms.to_le_bytes())?;
+                                writer.write_all(&s.duration_ms.to_le_bytes())?;
+                            }
+                        }
+                    }
+                    writer.flush()?;
+                }
+                std::fs::rename(&tmp, &path)?;
+                let _ = std::fs::File::create(&perf_log_path);
+                Ok(())
+            };
+            let _ = write_perf();
+
+            let write_flake = || -> std::io::Result<()> {
+                let path = self.dir.join("flake.bin");
+                let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+                {
+                    let file = std::fs::File::create(&tmp)?;
+                    let mut writer = BufWriter::new(file);
+                    writer.write_all(b"FLK1")?;
+                    for env_map in &db_disk.flake {
+                        writer.write_all(&(env_map.len() as u32).to_le_bytes())?;
+                        for (k, v) in env_map {
+                            writer.write_all(&k.to_le_bytes())?;
+                            writer.write_all(&v.runs.to_le_bytes())?;
+                            writer.write_all(&v.failures.to_le_bytes())?;
+                            writer.write_all(&v.last_failure_timestamp_ms.unwrap_or(u64::MAX).to_le_bytes())?;
+                            writer.write_all(&[v.last_failure_class.map(failure_class_to_u8).unwrap_or(0)])?;
+                        }
+                    }
+                    writer.flush()?;
+                }
+                std::fs::rename(&tmp, &path)?;
+                let _ = std::fs::File::create(&flake_log_path);
+                Ok(())
+            };
+            let _ = write_flake();
+        }
+
+        if lock_acquired {
+            let _ = std::fs::remove_file(&lock_path);
+        }
 
         Ok(())
     }
