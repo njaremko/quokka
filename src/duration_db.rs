@@ -471,6 +471,14 @@ impl DurationDb {
         }
     }
 
+    pub fn record_discovered_name(&mut self, test_id: &TestIdentity) {
+        let key = hash_key(test_id);
+        if !self.names.contains_key(&key) {
+            self.names.insert(key, test_id.clone());
+            self.new_names.push((key, test_id.clone()));
+        }
+    }
+
     pub fn record(
         &mut self,
         env: Environment,

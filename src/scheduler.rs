@@ -98,6 +98,11 @@ struct DbObservation {
     env: crate::duration_db::Environment,
 }
 
+enum ReporterMessage {
+    Finished(Vec<FinishedTest>),
+    Discovered(Vec<TestIdentity>),
+}
+
 /// One finished test, ready for the reporter to write and fold.
 struct FinishedTest {
     result: crate::proto::test::TestResult,
@@ -126,7 +131,7 @@ pub async fn run(
     let estimates = Arc::new(load_db(config.duration_db.as_deref()));
 
     // Single reporter task: sole orchestrator result-writer + verdict owner.
-    let (report_tx, report_rx) = mpsc::channel::<Vec<FinishedTest>>(config.limits.max_report_queue);
+    let (report_tx, report_rx) = mpsc::channel::<ReporterMessage>(config.limits.max_report_queue);
     let reporter_db = load_db(config.duration_db.as_deref());
     let reporter = tokio::spawn(reporter_task(
         orch.clone(),
@@ -205,56 +210,65 @@ const MAX_CONSOLE_FAILURES: u64 = 100;
 
 async fn reporter_task(
     orch: Orchestrator,
-    mut rx: mpsc::Receiver<Vec<FinishedTest>>,
+    mut rx: mpsc::Receiver<ReporterMessage>,
     mut db: DurationDb,
     context: crate::cli::SessionContext,
 ) -> RunVerdict {
     let mut verdict = RunVerdict::Pass;
     let mut tally = Tally::default();
-    while let Some(batch) = rx.recv().await {
-        for finished in batch {
-            tally.total += 1;
-            let failure = finished.status.is_failure();
-            match finished.status {
-                TestVerdict::Pass => tally.passed += 1,
-                TestVerdict::Skip | TestVerdict::Omitted => tally.skipped += 1,
-                _ => {}
-            }
-            // Capture the name for a live console line before the result is moved.
-            let fail_name = if failure && !finished.quarantined {
-                Some(finished.result.name.clone())
-            } else {
-                None
-            };
-            if let Err(e) = orch.report_test_result(finished.result).await {
-                eprintln!("quokka: failed to report a test result: {e:#}");
-            }
-            if failure {
-                if finished.quarantined {
-                    tally.quarantined_failed += 1;
-                } else {
-                    tally.failed += 1;
-                    verdict = RunVerdict::Fail;
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            ReporterMessage::Discovered(tids) => {
+                for tid in tids {
+                    db.record_discovered_name(&tid);
                 }
             }
-            // Live failure feedback on buck2's console (bounded to avoid flooding).
-            if let Some(name) = fail_name
-                && tally.failed <= MAX_CONSOLE_FAILURES
-            {
-                let _ = orch.console(Level::WARN, format!("FAIL {name}")).await;
-            }
-            // Record EACH fresh attempt as an independent flake/duration sample
-            // (a fail-then-pass flake records as runs+=2/failures+=1, not a clean
-            // pass). The folded `finished.status` drives the verdict/tally above;
-            // the DB sees the per-attempt history.
-            for obs in &finished.db_observations {
-                db.record(
-                    obs.env,
-                    &finished.test_id,
-                    obs.duration,
-                    obs.failed,
-                    obs.failure_class,
-                );
+            ReporterMessage::Finished(batch) => {
+                for finished in batch {
+                    tally.total += 1;
+                    let failure = finished.status.is_failure();
+                    match finished.status {
+                        TestVerdict::Pass => tally.passed += 1,
+                        TestVerdict::Skip | TestVerdict::Omitted => tally.skipped += 1,
+                        _ => {}
+                    }
+                    // Capture the name for a live console line before the result is moved.
+                    let fail_name = if failure && !finished.quarantined {
+                        Some(finished.result.name.clone())
+                    } else {
+                        None
+                    };
+                    if let Err(e) = orch.report_test_result(finished.result).await {
+                        eprintln!("quokka: failed to report a test result: {e:#}");
+                    }
+                    if failure {
+                        if finished.quarantined {
+                            tally.quarantined_failed += 1;
+                        } else {
+                            tally.failed += 1;
+                            verdict = RunVerdict::Fail;
+                        }
+                    }
+                    // Live failure feedback on buck2's console (bounded to avoid flooding).
+                    if let Some(name) = fail_name
+                        && tally.failed <= MAX_CONSOLE_FAILURES
+                    {
+                        let _ = orch.console(Level::WARN, format!("FAIL {name}")).await;
+                    }
+                    // Record EACH fresh attempt as an independent flake/duration sample
+                    // (a fail-then-pass flake records as runs+=2/failures+=1, not a clean
+                    // pass). The folded `finished.status` drives the verdict/tally above;
+                    // the DB sees the per-attempt history.
+                    for obs in &finished.db_observations {
+                        db.record(
+                            obs.env,
+                            &finished.test_id,
+                            obs.duration,
+                            obs.failed,
+                            obs.failure_class,
+                        );
+                    }
+                }
             }
         }
     }
@@ -305,7 +319,7 @@ struct TargetCtx {
     global_sem: Arc<Semaphore>,
     listing_sem: Arc<Semaphore>,
     estimates: Arc<DurationDb>,
-    report_tx: mpsc::Sender<Vec<FinishedTest>>,
+    report_tx: mpsc::Sender<ReporterMessage>,
 }
 
 /// The per-target policy derived once from labels + config.
@@ -539,6 +553,17 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
 
     // Report discovery of exactly this shard's tests (so reported >= discovered).
     let discovered: Vec<String> = kept.iter().map(|t| t.name.clone()).collect();
+    
+    let discovered_tids: Vec<TestIdentity> = tests
+        .iter()
+        .map(|t| TestIdentity {
+            target: plan.spec.display.clone(),
+            name: t.name.clone(),
+            variant: config.variant.clone(),
+        })
+        .collect();
+    let _ = ctx.report_tx.send(ReporterMessage::Discovered(discovered_tids)).await;
+
     let _ = ctx
         .orch
         .report_tests_discovered(
@@ -569,7 +594,7 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
             actions.spawn(async move {
                 let finished =
                     execute_test_action(&ctx, &plan, selection, expected_members, repeat_index, per_target_sem).await;
-                let _ = ctx.report_tx.send(finished).await;
+                 let _ = ctx.report_tx.send(ReporterMessage::Finished(finished)).await;
             });
         }
     }
@@ -1327,14 +1352,14 @@ async fn report_target_failure(
     let result = build_test_result(&run_id, plan.spec.handle_proto(), status, None, details, None);
     let _ = ctx
         .report_tx
-        .send(vec![FinishedTest {
+        .send(ReporterMessage::Finished(vec![FinishedTest {
             result,
             test_id,
             status,
             quarantined: plan.quarantined(),
             // A listing/target-level failure is not a per-test duration sample.
             db_observations: Vec::new(),
-        }])
+        }]))
         .await;
 }
 
