@@ -49,7 +49,7 @@ When `quokka` encounters a test case not previously seen in its local database, 
 
 Because Buck2's standard prelude does not natively expose `supports_test_execution_caching` as an attribute or set it in the standard `rust_test` rule, you must wrap `rust_test` to enable caching.
 
-You can define a wrapper rule in a Starlark extension file (e.g. `//rules:cached_rust_test.bzl`) that intercepts the providers from the prelude implementation and injects the capability:
+This repository provides a custom wrapper rule under `rules/` (specifically `rules/cached_rust_test.bzl`) that intercepts the providers from the prelude implementation and injects the capability:
 
 ```python
 load("@prelude//rust:rust_binary.bzl", "rust_test_impl")
@@ -67,7 +67,7 @@ def _cached_rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
 
     if test_info != None:
         new_test_info = ExternalRunnerTestInfo(
-            type = test_info.type,
+            type = getattr(test_info, "test_type", "rust"),
             command = test_info.command,
             env = test_info.env,
             labels = test_info.labels,
@@ -77,6 +77,10 @@ def _cached_rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
             run_from_project_root = test_info.run_from_project_root,
             use_project_relative_paths = test_info.use_project_relative_paths,
             supports_test_execution_caching = True,  # <-- Enable Caching
+            local_resources = getattr(test_info, "local_resources", None),
+            required_local_resources = getattr(test_info, "required_local_resources", None),
+            network_access = getattr(test_info, "network_access", None),
+            worker = getattr(test_info, "worker", None),
         )
         for p in providers:
             if type(p) == "ExternalRunnerTestInfo":
@@ -113,6 +117,7 @@ cached_rust_test(
 | Path | What |
 | --- | --- |
 | `src/` | The runner (scheduler, translator, transport, result/verdict, duration DB, …). |
+| `rules/` | Custom Buck2 rule definitions (e.g., `cached_rust_test.bzl` wrapping the prelude's `rust_test` to enable caching). |
 | `proto/` | Vendored Buck2 test-protocol `.proto`s + `regenerate.sh`. Bindings are pre-generated into `src/proto/gen/` (no `protoc` at build time). |
 | `tests/` | `scheduler_integration.rs` — end-to-end fan-out/verdict/retry tests against an in-process orchestrator. |
 | `nix/` | The nix↔Buck2 toolchain bridge: `flake.nix` exposes rustc/clang/llvm, `remote_flake.bzl` wraps them as Buck2 `RunInfo` targets (`//nix:*`), `buck2.nix` pins the Buck2 binary. |
