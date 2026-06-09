@@ -16,6 +16,35 @@ Point a host repo's `.buckconfig` at the built binary to use it:
   v2_test_executor = /path/to/quokka
 ```
 
+## Caching & Flakiness
+
+By integrating with Buck2's TPX protocol, `quokka` controls when test execution actions are cached via the `disable_test_execution_caching` option.
+
+### Controlling Caching with Labels
+You can disable caching for a specific test target by adding non-hermetic or unstable labels to it in your `BUCK` file. Caching is disabled if a label matches or ends with any of the following (separated by `:`):
+* `cache_disabled`
+* `flaky` (e.g., `rust:flaky`)
+* `uses_network`
+* `uses_wall_clock`
+* `uses_randomness_without_seed`
+* `requires_external_service`
+* `serial_global_state`
+* `stress`
+* `network-private`
+
+### Flaky Test Retries
+If a test is known to flake (meaning it has at least one failure recorded in the local history database), `quokka` will internally manage retries. The maximum retry attempts are configured via a TOML file located at `$HOME/.quokka/config.toml`:
+
+```toml
+[flaky_retry]
+attempts = 3
+```
+
+During retry attempts, caching is bypassed to guarantee fresh execution results.
+
+### Unseen Test Cache-Busting
+When `quokka` encounters a test case not previously seen in its local database, it bypasses caching (`disable_test_execution_caching = true`) for the initial run. This ensures the runner gathers a baseline duration to populate the performance tracking database. Subsequent runs of the same binary are allowed to hit the cache (assuming they pass and have no flake or non-hermetic labels).
+
 ## Layout
 
 | Path | What |
