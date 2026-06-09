@@ -13,6 +13,10 @@ pub struct FlakyRetryConfig {
 
 pub fn load_config() -> QuokkaConfig {
     let home = std::env::var("HOME").ok().map(PathBuf::from);
+    load_config_from_home(home)
+}
+
+pub fn load_config_from_home(home: Option<PathBuf>) -> QuokkaConfig {
     if let Some(home) = home {
         let path = home.join(".quokka/config.toml");
         if path.exists() {

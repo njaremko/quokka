@@ -704,10 +704,6 @@ attempts = 3
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).unwrap();
 
-    // Set HOME so load_config reads our temp config
-    let old_home = std::env::var("HOME").ok();
-    std::env::set_var("HOME", &temp_home);
-
     let temp_db = std::env::temp_dir().join(format!("quokka-db-{}", ts));
     std::fs::create_dir_all(&temp_db).unwrap();
 
@@ -721,8 +717,7 @@ attempts = 3
         
         let mut config = test_config();
         config.duration_db = Some(temp_db.clone());
-        // Reload quokka config to pick up the new HOME env
-        config.quokka_config = quokka::config::load_config();
+        config.quokka_config = quokka::config::load_config_from_home(Some(temp_home.clone()));
         
         drive_to_completion(orch, intake_rx, config, test_context()).await;
     }
@@ -739,7 +734,7 @@ attempts = 3
         
         let mut config = test_config();
         config.duration_db = Some(temp_db.clone());
-        config.quokka_config = quokka::config::load_config();
+        config.quokka_config = quokka::config::load_config_from_home(Some(temp_home.clone()));
         
         drive_to_completion(orch, intake_rx, config, test_context()).await;
         let rec = recorded.lock().expect("recorded mutex poisoned");
@@ -750,11 +745,6 @@ attempts = 3
     }
 
     // Clean up
-    if let Some(h) = old_home {
-        std::env::set_var("HOME", h);
-    } else {
-        std::env::remove_var("HOME");
-    }
     let _ = std::fs::remove_dir_all(&temp_home);
     let _ = std::fs::remove_dir_all(&temp_db);
 }
