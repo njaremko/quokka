@@ -17,6 +17,7 @@ THIRD_PARTY = [
     "//third-party:serde_json",
     "//third-party:thiserror",
     "//third-party:tokio",
+    "//third-party:toml",
     "//third-party:tonic",
     "//third-party:tower",
     "//third-party:tracing",

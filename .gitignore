@@ -13,6 +13,9 @@
 /quokka-db
 /.tmp
 
+.buckconfig.local
+
+
 # devenv / direnv
 /.devenv
 /.devenv.flake.nix

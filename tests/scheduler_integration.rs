@@ -35,6 +35,8 @@ struct Recorded {
     testing_calls: Vec<Vec<String>>,
     /// How many times each test has appeared in a Testing action (for flaky-once).
     testing_seen: std::collections::HashMap<String, u32>,
+    /// Captured disable_test_execution_caching flags for each Testing call.
+    disable_caching_calls: Vec<bool>,
 }
 
 /// A mock buck2 orchestrator. For each test name, a status is canned; the mock
@@ -137,6 +139,7 @@ impl TestOrchestrator for MockBuck2 {
                 }
                 let mut rec = self.recorded.lock().expect("recorded mutex poisoned");
                 rec.testing_calls.push(effective_testcases.clone());
+                rec.disable_caching_calls.push(req.disable_test_execution_caching);
                 if self.cache_replay {
                     // Cache hit: exit 0, no streams. The runner must read PASS
                     // from the exit status alone (buck2 returns empty stdout).
@@ -636,4 +639,122 @@ async fn cached_replay_with_empty_output_reports_pass_from_exit_code() {
             .collect::<Vec<_>>()
     );
     assert_eq!(rec.end_exit_code, Some(0));
+}
+
+#[tokio::test]
+async fn unseen_then_seen_test_caching() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("quokka-test-db-{}", ts));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let events = vec![("a".to_string(), "ok")];
+    
+    // First run: cold/empty database (unseen test)
+    {
+        let (orch, recorded, _server) = mock_orchestrator(events.clone()).await;
+        let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+        intake_tx.send(SpecEnvelope::Spec(Box::new(libtest_spec(1)))).unwrap();
+        intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+        
+        let mut config = test_config();
+        config.duration_db = Some(temp_dir.clone());
+        
+        drive_to_completion(orch, intake_rx, config, test_context()).await;
+        let rec = recorded.lock().expect("recorded mutex poisoned");
+        assert!(!rec.disable_caching_calls.is_empty());
+        assert!(rec.disable_caching_calls[0], "expected caching disabled for unseen test");
+    }
+
+    // Second run: database now contains the test (seen test)
+    {
+        let (orch, recorded, _server) = mock_orchestrator(events).await;
+        let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+        intake_tx.send(SpecEnvelope::Spec(Box::new(libtest_spec(1)))).unwrap();
+        intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+        
+        let mut config = test_config();
+        config.duration_db = Some(temp_dir.clone());
+        
+        drive_to_completion(orch, intake_rx, config, test_context()).await;
+        let rec = recorded.lock().expect("recorded mutex poisoned");
+        assert!(!rec.disable_caching_calls.is_empty());
+        assert!(!rec.disable_caching_calls[0], "expected caching enabled for seen test");
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn flaky_retry_via_toml_config() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_home = std::env::temp_dir().join(format!("quokka-home-{}", ts));
+    let config_dir = temp_home.join(".quokka");
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    // Write config toml
+    let config_toml = r#"
+[flaky_retry]
+attempts = 3
+"#;
+    std::fs::write(config_dir.join("config.toml"), config_toml).unwrap();
+
+    // Set HOME so load_config reads our temp config
+    let old_home = std::env::var("HOME").ok();
+    std::env::set_var("HOME", &temp_home);
+
+    let temp_db = std::env::temp_dir().join(format!("quokka-db-{}", ts));
+    std::fs::create_dir_all(&temp_db).unwrap();
+
+    // 1. First, populate the database with a failure so it is "known to flake"
+    let events = vec![("a".to_string(), "failed")];
+    {
+        let (orch, _recorded, _server) = mock_orchestrator(events.clone()).await;
+        let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+        intake_tx.send(SpecEnvelope::Spec(Box::new(libtest_spec(1)))).unwrap();
+        intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+        
+        let mut config = test_config();
+        config.duration_db = Some(temp_db.clone());
+        // Reload quokka config to pick up the new HOME env
+        config.quokka_config = quokka::config::load_config();
+        
+        drive_to_completion(orch, intake_rx, config, test_context()).await;
+    }
+
+    // 2. Now run the test again, but configure the mock orchestrator so "a" fails the first time
+    // and passes thereafter (flaky_once). The DB already has recorded 1 failure for it,
+    // so it is known to flake. Thus, it should retry up to 3 times (from TOML config) and PASS.
+    let events = vec![("a".to_string(), "ok")];
+    {
+        let (orch, recorded, _server) = mock_orchestrator_full(events, None, Some("a".to_string()), false).await;
+        let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+        intake_tx.send(SpecEnvelope::Spec(Box::new(libtest_spec(1)))).unwrap();
+        intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+        
+        let mut config = test_config();
+        config.duration_db = Some(temp_db.clone());
+        config.quokka_config = quokka::config::load_config();
+        
+        drive_to_completion(orch, intake_rx, config, test_context()).await;
+        let rec = recorded.lock().expect("recorded mutex poisoned");
+        assert_eq!(rec.results.len(), 1);
+        assert_eq!(rec.results[0].status, TestStatus::Pass as i32, "should pass on retry");
+        assert_eq!(rec.testing_seen.get("a"), Some(&2), "should have run twice");
+        assert_eq!(rec.end_exit_code, Some(0), "verdict should be PASS");
+    }
+
+    // Clean up
+    if let Some(h) = old_home {
+        std::env::set_var("HOME", h);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    let _ = std::fs::remove_dir_all(&temp_home);
+    let _ = std::fs::remove_dir_all(&temp_db);
 }

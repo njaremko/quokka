@@ -764,12 +764,27 @@ async fn run_group(
     let mut infra_attempt = 0u32;
     loop {
         let attempt_index = failure_attempt + infra_attempt;
-        let caching = crate::caching::TestExecutionCaching::resolve(
+        let mut has_unseen = false;
+        for name in names {
+            let test_id = TestIdentity {
+                target: plan.spec.display.to_owned(),
+                name: name.to_owned(),
+                variant: config.variant.clone(),
+            };
+            if matches!(ctx.estimates.estimate(None, &test_id), crate::duration_db::DurationEstimate::Unseen) {
+                has_unseen = true;
+                break;
+            }
+        }
+        let mut caching = crate::caching::TestExecutionCaching::resolve(
             plan.cache_class,
             config.variant.is_default(),
             plan.repeat.is_stress(),
             attempt_index,
         );
+        if has_unseen {
+            caching = crate::caching::TestExecutionCaching::Disabled;
+        }
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let exec_args = plan.translator.execution_args(
             &name_refs,
@@ -1030,9 +1045,31 @@ async fn execute_test_action(
             break;
         }
         // Flaky-retry budget: re-run only the still-failing members.
-        if plan.retry.allows_retry() && failure_attempt + 1 < plan.retry.max_attempts() {
+        let mut retry_pending = Vec::new();
+        for name in &still_failing {
+            let base_attempts = plan.retry.max_attempts();
+            let is_flake = {
+                let test_id = TestIdentity {
+                    target: plan.spec.display.to_owned(),
+                    name: name.to_owned(),
+                    variant: ctx.config.variant.clone(),
+                };
+                ctx.estimates.flake(None, &test_id).map(|f| f.failures > 0).unwrap_or(false)
+            };
+            let toml_attempts = if is_flake {
+                ctx.config.quokka_config.flaky_retry.as_ref().map(|c| c.attempts).unwrap_or(0)
+            } else {
+                0
+            };
+            let allowed_attempts = base_attempts.max(toml_attempts);
+            if failure_attempt + 1 < allowed_attempts {
+                retry_pending.push(name.clone());
+            }
+        }
+
+        if !retry_pending.is_empty() {
             failure_attempt += 1;
-            pending = still_failing;
+            pending = retry_pending;
             continue;
         }
         // Retries exhausted. Isolate a multi-member batch's remaining failures so

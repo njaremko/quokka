@@ -9,6 +9,7 @@
 pub mod batching;
 pub mod caching;
 pub mod cli;
+pub mod config;
 pub mod duration_db;
 pub mod environment;
 pub mod execution;

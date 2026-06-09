@@ -27,6 +27,7 @@
   serde_json   = "1.0.134"
   thiserror    = "2.0"
   tonic        = "0.12"
+  toml         = "0.8"
   tower        = { version = "0.4.13", features = ["full"] }
   tracing      = { version = "0.1.41", features = ["std"] }
   # `net` for Unix/TCP sockets to the buck2 daemon; `rt-multi-thread` so the

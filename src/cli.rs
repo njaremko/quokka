@@ -203,6 +203,7 @@ pub struct RunnerConfig {
     pub duration_db: Option<PathBuf>,
     pub extra_test_args: Vec<String>,
     pub extra_env: Vec<(String, String)>,
+    pub quokka_config: crate::config::QuokkaConfig,
 }
 
 /// Contextual metadata for the test session.
@@ -399,6 +400,7 @@ fn resolve_config(outer: &OuterCli, tpx: TpxConfig) -> Result<(RunnerConfig, Ses
         duration_db: tpx.duration_db,
         extra_test_args: tpx.test_arg,
         extra_env,
+        quokka_config: crate::config::load_config(),
     };
 
     let context = SessionContext {
