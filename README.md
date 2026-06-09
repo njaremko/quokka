@@ -45,6 +45,69 @@ During retry attempts, caching is bypassed to guarantee fresh execution results.
 ### Unseen Test Cache-Busting
 When `quokka` encounters a test case not previously seen in its local database, it bypasses caching (`disable_test_execution_caching = true`) for the initial run. This ensures the runner gathers a baseline duration to populate the performance tracking database. Subsequent runs of the same binary are allowed to hit the cache (assuming they pass and have no flake or non-hermetic labels).
 
+### Enabling Caching for Rust Tests
+
+Because Buck2's standard prelude does not natively expose `supports_test_execution_caching` as an attribute or set it in the standard `rust_test` rule, you must wrap `rust_test` to enable caching.
+
+You can define a wrapper rule in a Starlark extension file (e.g. `//rules:cached_rust_test.bzl`) that intercepts the providers from the prelude implementation and injects the capability:
+
+```python
+load("@prelude//rust:rust_binary.bzl", "rust_test_impl")
+load("@prelude//decls:rust_rules.bzl", "rust_test")
+
+def _cached_rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
+    providers = rust_test_impl(ctx)
+    new_providers = []
+    test_info = None
+    
+    for p in providers:
+        if type(p) == "ExternalRunnerTestInfo":
+            test_info = p
+            break
+
+    if test_info != None:
+        new_test_info = ExternalRunnerTestInfo(
+            type = test_info.type,
+            command = test_info.command,
+            env = test_info.env,
+            labels = test_info.labels,
+            contacts = test_info.contacts,
+            default_executor = test_info.default_executor,
+            executor_overrides = test_info.executor_overrides,
+            run_from_project_root = test_info.run_from_project_root,
+            use_project_relative_paths = test_info.use_project_relative_paths,
+            supports_test_execution_caching = True,  # <-- Enable Caching
+        )
+        for p in providers:
+            if type(p) == "ExternalRunnerTestInfo":
+                new_providers.append(new_test_info)
+            else:
+                new_providers.append(p)
+    else:
+        new_providers = providers
+        
+    return new_providers
+
+cached_rust_test = rule(
+    impl = _cached_rust_test_impl,
+    attrs = rust_test.attrs,
+    uses_plugins = rust_test.uses_plugins,
+    supports_incoming_transition = getattr(rust_test, "supports_incoming_transition", True),
+)
+```
+
+Then, import and use this wrapper in your `BUCK` files:
+
+```python
+load("//rules:cached_rust_test.bzl", "cached_rust_test")
+
+cached_rust_test(
+    name = "my_cached_test",
+    srcs = ["src/lib.rs"],
+    edition = "2024",
+)
+```
+
 ## Layout
 
 | Path | What |
