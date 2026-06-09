@@ -18,7 +18,7 @@ Point a host repo's `.buckconfig` at the built binary to use it:
 
 ## Caching & Flakiness
 
-By integrating with Buck2's TPX protocol, `quokka` controls when test execution actions are cached via the `disable_test_execution_caching` option.
+By integrating with Buck2's external test runner protocol, `quokka` controls when test execution actions are cached via the `disable_test_execution_caching` option.
 
 ### Controlling Caching with Labels
 You can disable caching for a specific test target by adding non-hermetic or unstable labels to it in your `BUCK` file. Caching is disabled if a label matches or ends with any of the following (separated by `:`):
