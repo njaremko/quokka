@@ -45,8 +45,10 @@ rust_binary(
     visibility = ["PUBLIC"],
 )
 
+load("//rules:cached_rust_test.bzl", "cached_rust_test")
+
 # Unit tests live inside the library modules; compile the crate with `--test`.
-rust_test(
+cached_rust_test(
     name = "quokka-lib-test",
     srcs = _LIB_SRCS,
     crate = "quokka",
@@ -56,7 +58,7 @@ rust_test(
     visibility = ["PUBLIC"],
 )
 
-rust_test(
+cached_rust_test(
     name = "scheduler_integration",
     srcs = ["tests/scheduler_integration.rs"],
     crate_root = "tests/scheduler_integration.rs",
@@ -64,3 +66,6 @@ rust_test(
     deps = [":quokka-lib"] + THIRD_PARTY,
     visibility = ["PUBLIC"],
 )
+
+
+

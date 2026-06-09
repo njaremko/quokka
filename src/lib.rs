@@ -26,3 +26,4 @@ pub mod spec;
 pub mod translator;
 pub mod transport;
 pub mod variant;
+pub mod db_cli;

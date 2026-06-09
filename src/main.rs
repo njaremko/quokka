@@ -30,8 +30,46 @@ fn default_duration_db() -> Option<PathBuf> {
     }
 }
 
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "quokka", about = "Quokka: A better external test runner for Buck2")]
+struct QuokkaCli {
+    #[command(subcommand)]
+    subcommand: Subcommands,
+}
+
+#[derive(clap::Subcommand)]
+enum Subcommands {
+    /// Database introspection commands
+    Db(quokka::db_cli::DbCli),
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
+
+    let has_db_cmd = if let Some(dash_dash_idx) = argv.iter().position(|s| s == "--") {
+        argv[..dash_dash_idx].iter().any(|s| s == "db")
+    } else {
+        argv.iter().any(|s| s == "db")
+    };
+
+    if has_db_cmd {
+        match QuokkaCli::try_parse_from(&argv) {
+            Ok(cli) => {
+                let Subcommands::Db(db_cli) = cli.subcommand;
+                if let Err(e) = quokka::db_cli::run_db_command(db_cli) {
+                    eprintln!("quokka db error: {e}");
+                    return ExitCode::from(1);
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                e.exit();
+            }
+        }
+    }
+
     let mut invocation = match cli::parse(argv) {
         Ok(invocation) => invocation,
         Err(e) => {

@@ -133,6 +133,40 @@ fn failure_class_from_u8(val: u8) -> Option<FailureClass> {
     }
 }
 
+fn read_string<R: Read>(reader: &mut R) -> Option<String> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).ok()?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > 10_000 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
+fn write_string<W: Write>(writer: &mut W, s: &str) -> std::io::Result<()> {
+    writer.write_all(&(s.len() as u32).to_le_bytes())?;
+    writer.write_all(s.as_bytes())?;
+    Ok(())
+}
+
+fn read_test_identity<R: Read>(reader: &mut R) -> Option<TestIdentity> {
+    let target = read_string(reader)?;
+    let name = read_string(reader)?;
+    let variant_str = read_string(reader)?;
+    let variant = crate::variant::Variant::parse(&variant_str);
+    Some(TestIdentity { target, name, variant })
+}
+
+fn write_test_identity<W: Write>(writer: &mut W, tid: &TestIdentity) -> std::io::Result<()> {
+    write_string(writer, &tid.target)?;
+    write_string(writer, &tid.name)?;
+    let variant_str = tid.variant.identity().unwrap_or_else(|| "default".to_owned());
+    write_string(writer, &variant_str)?;
+    Ok(())
+}
+
 fn hash_key(test_id: &TestIdentity) -> u64 {
     let mut hasher = FxHasher::default();
     crate::result::project_dir_key().hash(&mut hasher);
@@ -145,8 +179,10 @@ pub struct DurationDb {
     dir: PathBuf,
     perf: [FxHashMap<u64, PerfRecord>; 2],
     flake: [FxHashMap<u64, FlakeRecord>; 2],
+    names: FxHashMap<u64, TestIdentity>,
     new_perf_samples: Vec<(Environment, u64, u64, u64)>, // env, key, timestamp, duration
     new_flake_records: Vec<(Environment, u64, bool, Option<FailureClass>, u64)>, // env, key, failed, class, timestamp
+    new_names: Vec<(u64, TestIdentity)>,
 }
 
 impl DurationDb {
@@ -155,6 +191,7 @@ impl DurationDb {
     pub fn load(dir: PathBuf) -> Self {
         let mut perf = [FxHashMap::default(), FxHashMap::default()];
         let mut flake = [FxHashMap::default(), FxHashMap::default()];
+        let mut names = FxHashMap::default();
 
         if let Ok(file) = std::fs::File::open(dir.join("perf.bin")) {
             let mut reader = BufReader::new(file);
@@ -260,12 +297,53 @@ impl DurationDb {
             }
         }
 
+        if let Ok(file) = std::fs::File::open(dir.join("names.bin")) {
+            let mut reader = BufReader::new(file);
+            let mut magic = [0u8; 4];
+            if reader.read_exact(&mut magic).is_ok() && &magic == b"NMS1" {
+                let mut len_buf = [0u8; 4];
+                if reader.read_exact(&mut len_buf).is_ok() {
+                    let len = u32::from_le_bytes(len_buf);
+                    names.reserve((len as usize).min(1_000_000));
+                    for _ in 0..len {
+                        let mut k_buf = [0u8; 8];
+                        if reader.read_exact(&mut k_buf).is_ok() {
+                            let k = u64::from_le_bytes(k_buf);
+                            if let Some(tid) = read_test_identity(&mut reader) {
+                                names.insert(k, tid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(mut file) = std::fs::File::open(dir.join("names.log")) {
+            let mut buf = Vec::new();
+            if file.read_to_end(&mut buf).is_ok() {
+                let mut reader = std::io::Cursor::new(buf);
+                while reader.position() < reader.get_ref().len() as u64 {
+                    let mut k_buf = [0u8; 8];
+                    if reader.read_exact(&mut k_buf).is_ok() {
+                        let k = u64::from_le_bytes(k_buf);
+                        if let Some(tid) = read_test_identity(&mut reader) {
+                            names.insert(k, tid);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
         Self {
             dir,
             perf,
             flake,
+            names,
             new_perf_samples: Vec::new(),
             new_flake_records: Vec::new(),
+            new_names: Vec::new(),
         }
     }
 
@@ -275,8 +353,63 @@ impl DurationDb {
             dir: PathBuf::new(),
             perf: [FxHashMap::default(), FxHashMap::default()],
             flake: [FxHashMap::default(), FxHashMap::default()],
+            names: FxHashMap::default(),
             new_perf_samples: Vec::new(),
             new_flake_records: Vec::new(),
+            new_names: Vec::new(),
+        }
+    }
+
+    pub fn all_keys(&self) -> Vec<u64> {
+        let mut keys: Vec<u64> = self.perf.iter().flat_map(|m| m.keys().copied()).collect();
+        for map in &self.flake {
+            keys.extend(map.keys().copied());
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    pub fn get_name(&self, key: u64) -> Option<&TestIdentity> {
+        self.names.get(&key)
+    }
+
+    pub fn get_perf_samples(&self, env: Option<Environment>, key: u64) -> Vec<DurationSample> {
+        let mut combined = PerfRecord::default();
+        if let Some(e) = env {
+            if let Some(record) = self.perf[e.to_index()].get(&key) {
+                combined.combine(record);
+            }
+        } else {
+            for e in Environment::ALL {
+                if let Some(record) = self.perf[e.to_index()].get(&key) {
+                    combined.combine(record);
+                }
+            }
+        }
+        combined.samples
+    }
+
+    pub fn get_flake_record(&self, env: Option<Environment>, key: u64) -> Option<FlakeRecord> {
+        let mut combined = FlakeRecord::default();
+        let mut found = false;
+        if let Some(e) = env {
+            if let Some(record) = self.flake[e.to_index()].get(&key) {
+                combined.combine(record);
+                found = true;
+            }
+        } else {
+            for e in Environment::ALL {
+                if let Some(record) = self.flake[e.to_index()].get(&key) {
+                    combined.combine(record);
+                    found = true;
+                }
+            }
+        }
+        if found {
+            Some(combined)
+        } else {
+            None
         }
     }
 
@@ -284,6 +417,10 @@ impl DurationDb {
     /// otherwise aggregates across environments.
     pub fn estimate(&self, env: Option<Environment>, test_id: &TestIdentity) -> DurationEstimate {
         let key = hash_key(test_id);
+        self.estimate_by_key(env, key)
+    }
+
+    pub fn estimate_by_key(&self, env: Option<Environment>, key: u64) -> DurationEstimate {
         let mut combined = PerfRecord::default();
         if let Some(e) = env {
             if let Some(record) = self.perf[e.to_index()].get(&key) {
@@ -359,6 +496,10 @@ impl DurationDb {
         timestamp_ms: u64,
     ) {
         let key = hash_key(test_id);
+        if !self.names.contains_key(&key) {
+            self.names.insert(key, test_id.clone());
+            self.new_names.push((key, test_id.clone()));
+        }
         if !failed {
             let perf = self.perf[env.to_index()].entry(key).or_default();
             perf.record(timestamp_ms, duration.as_millis() as u64);
@@ -378,6 +519,12 @@ impl DurationDb {
         for (i, tests) in other.flake.into_iter().enumerate() {
             for (k, v) in tests {
                 self.flake[i].entry(k).or_default().combine(&v);
+            }
+        }
+        for (k, v) in other.names {
+            if !self.names.contains_key(&k) {
+                self.names.insert(k, v.clone());
+                self.new_names.push((k, v));
             }
         }
         self.new_perf_samples.append(&mut other.new_perf_samples);
@@ -443,10 +590,25 @@ impl DurationDb {
             self.new_flake_records.clear();
         }
 
+        let names_log_path = self.dir.join("names.log");
+        if !self.new_names.is_empty() {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&names_log_path) {
+                let mut buf = Vec::new();
+                for (key, tid) in &self.new_names {
+                    buf.extend_from_slice(&key.to_le_bytes());
+                    let _ = write_test_identity(&mut buf, tid);
+                }
+                let _ = file.write_all(&buf);
+                let _ = file.sync_data();
+            }
+            self.new_names.clear();
+        }
+
         let perf_size = std::fs::metadata(&perf_log_path).map(|m| m.len()).unwrap_or(0);
         let flake_size = std::fs::metadata(&flake_log_path).map(|m| m.len()).unwrap_or(0);
+        let names_size = std::fs::metadata(&names_log_path).map(|m| m.len()).unwrap_or(0);
 
-        if perf_size > 512 * 1024 || flake_size > 512 * 1024 {
+        if perf_size > 512 * 1024 || flake_size > 512 * 1024 || names_size > 512 * 1024 {
             let db_disk = Self::load(self.dir.clone());
 
             let write_perf = || -> std::io::Result<()> {
@@ -499,6 +661,26 @@ impl DurationDb {
                 Ok(())
             };
             let _ = write_flake();
+
+            let write_names = || -> std::io::Result<()> {
+                let path = self.dir.join("names.bin");
+                let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+                {
+                    let file = std::fs::File::create(&tmp)?;
+                    let mut writer = BufWriter::new(file);
+                    writer.write_all(b"NMS1")?;
+                    writer.write_all(&(db_disk.names.len() as u32).to_le_bytes())?;
+                    for (k, v) in &db_disk.names {
+                        writer.write_all(&k.to_le_bytes())?;
+                        write_test_identity(&mut writer, v)?;
+                    }
+                    writer.flush()?;
+                }
+                std::fs::rename(&tmp, &path)?;
+                let _ = std::fs::File::create(&names_log_path);
+                Ok(())
+            };
+            let _ = write_names();
         }
 
         if lock_acquired {
@@ -609,6 +791,7 @@ mod tests {
             DurationEstimate::Measured { .. }
         ));
         assert_eq!(db.flake(None, &tid).unwrap().failures, 1);
+        assert_eq!(db.get_name(hash_key(&tid)), Some(&tid));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
