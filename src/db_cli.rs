@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::io::Write;
 use clap::Parser;
 use crate::duration_db::{DurationDb, Environment};
 
@@ -79,7 +80,7 @@ pub fn run_db_command(cli: DbCli) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_stats(db_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let db = DurationDb::load(db_path.clone());
-    println!("Database directory: {}", db_path.display());
+    let mut out = std::io::BufWriter::new(std::io::stdout());
     
     // File sizes on disk
     let perf_bin_sz = std::fs::metadata(db_path.join("perf.bin")).map(|m| m.len()).unwrap_or(0);
@@ -111,11 +112,22 @@ fn run_stats(db_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
-    println!("Total size on disk:  {:.2} KB", total_size as f64 / 1024.0);
-    println!("Total distinct keys: {}", total_keys);
-    println!("Named test records:  {}", named_count);
-    println!("Total test runs:     {}", total_runs);
-    println!("Total failures:      {}", total_failures);
+    let mut print_stats = || -> std::io::Result<()> {
+        writeln!(out, "Database directory: {}", db_path.display())?;
+        writeln!(out, "Total size on disk:  {:.2} KB", total_size as f64 / 1024.0)?;
+        writeln!(out, "Total distinct keys: {}", total_keys)?;
+        writeln!(out, "Named test records:  {}", named_count)?;
+        writeln!(out, "Total test runs:     {}", total_runs)?;
+        writeln!(out, "Total failures:      {}", total_failures)?;
+        out.flush()?;
+        Ok(())
+    };
+    
+    if let Err(e) = print_stats() {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(e.into());
+        }
+    }
     
     Ok(())
 }
@@ -206,11 +218,22 @@ fn run_list(
         }
     }
     
+    let mut out = std::io::BufWriter::new(std::io::stdout());
+    
     if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        let json_str = serde_json::to_string_pretty(&rows)?;
+        use std::io::Write;
+        if let Err(e) = writeln!(out, "{}", json_str) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
     } else {
         if rows.is_empty() {
-            println!("No records found.");
+            use std::io::Write;
+            let _ = writeln!(out, "No records found.");
+            let _ = out.flush();
             return Ok(());
         }
         
@@ -228,23 +251,37 @@ fn run_list(
             col_widths[7] = col_widths[7].max(format!("{:.1}%", r.flake_rate).len());
         }
         
-        let print_row = |vals: &[String]| {
+        let mut print_row = |vals: &[String]| -> std::io::Result<()> {
+            use std::io::Write;
             for (i, val) in vals.iter().enumerate() {
                 let width = col_widths[i];
                 let is_numeric = i >= 3;
                 if is_numeric {
-                    print!("{:>width$} ", val, width = width);
+                    write!(out, "{:>width$} ", val, width = width)?;
                 } else {
-                    print!("{:<width$} ", val, width = width);
+                    write!(out, "{:<width$} ", val, width = width)?;
                 }
             }
-            println!();
+            writeln!(out)?;
+            Ok(())
         };
         
-        print_row(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>());
+        let handle_err = |e: std::io::Error| -> Result<(), Box<dyn std::error::Error>> {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                Ok(())
+            } else {
+                Err(e.into())
+            }
+        };
+        
+        if let Err(e) = print_row(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>()) {
+            return handle_err(e);
+        }
         
         let separator = col_widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>();
-        print_row(&separator);
+        if let Err(e) = print_row(&separator) {
+            return handle_err(e);
+        }
         
         for r in &rows {
             let p50_str = r.p50_ms.map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_owned());
@@ -261,10 +298,13 @@ fn run_list(
                 r.failures.to_string(),
                 flake_str,
             ];
-            print_row(&vals);
+            if let Err(e) = print_row(&vals) {
+                return handle_err(e);
+            }
         }
     }
     
+    let _ = out.flush();
     Ok(())
 }
 

@@ -41,7 +41,7 @@ rust_binary(
     crate = "quokka",
     crate_root = "src/main.rs",
     edition = "2024",
-    deps = [":quokka-lib", "//third-party:tokio"],
+    deps = [":quokka-lib", "//third-party:tokio", "//third-party:clap"],
     visibility = ["PUBLIC"],
 )
 

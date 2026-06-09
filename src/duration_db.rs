@@ -1,7 +1,7 @@
 use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::result::{FailureClass, TestIdentity};
