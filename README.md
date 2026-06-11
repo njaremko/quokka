@@ -5,7 +5,7 @@ A better **external test runner for [Buck2](https://buck2.build)**.
 Quokka is primarily optimized for rust projects at the moment, but I'll probably add support for other languages in the future.
 
 If you use remote execution, quokka will give you the following "for free":
-- Automatic distributed sharing of unit tests across your fleet of workers
+- Automatic distributed sharding of unit tests across your fleet of workers
 - Caching of test results, so only changed crates have to run
 - Test duration and flake tracking of your test suite
 
