@@ -41,13 +41,13 @@ use crate::duration_db::{DurationDb, DurationEstimate};
 use crate::execution::{TestingRequest, build_listing_request, build_testing_request};
 use crate::executor_server::SpecEnvelope;
 
+use crate::environment::{SchedulingProfile, profile_from_labels};
 use crate::listing::{IgnoredPolicy, TestCase};
 use crate::orchestrator::Orchestrator;
 use crate::policy::{self, Owner, QuarantineStatus, RetryPolicy};
-use crate::environment::{SchedulingProfile, profile_from_labels};
 use crate::result::{
-    self, Execute2Outcome, FailureClass, ProcessOutcome, TestVerdict, build_test_result,
-    decode_response, TestIdentity, RunIdentity,
+    self, Execute2Outcome, FailureClass, ProcessOutcome, RunIdentity, TestIdentity, TestVerdict,
+    build_test_result, decode_response,
 };
 use crate::spec::TargetSpec;
 use crate::translator::{ListingStrategy, PerTestObservation, Translator, TranslatorRegistry};
@@ -133,12 +133,7 @@ pub async fn run(
     // Single reporter task: sole orchestrator result-writer + verdict owner.
     let (report_tx, report_rx) = mpsc::channel::<ReporterMessage>(config.limits.max_report_queue);
     let reporter_db = load_db(config.duration_db.as_deref());
-    let reporter = tokio::spawn(reporter_task(
-        orch.clone(),
-        report_rx,
-        reporter_db,
-        context,
-    ));
+    let reporter = tokio::spawn(reporter_task(orch.clone(), report_rx, reporter_db, context));
 
     // Drive targets concurrently as their specs arrive.
     let mut target_tasks = JoinSet::new();
@@ -341,14 +336,20 @@ struct TargetPlan {
 impl TargetPlan {
     fn derive(spec: Arc<TargetSpec>, config: &RunnerConfig, registry: &TranslatorRegistry) -> Self {
         let labels: &[String] = &spec.labels;
-        let translator = registry.resolve(&spec.test_type, config)
-            .unwrap_or_else(|| panic!("No translator registered for test_type: {}", spec.test_type));
+        let translator = registry
+            .resolve(&spec.test_type, config)
+            .unwrap_or_else(|| {
+                panic!("No translator registered for test_type: {}", spec.test_type)
+            });
         // The `rust:stress` label means "run this target repeatedly". A global
         // `--stress N` takes precedence (it stresses every target); otherwise the
         // label opts this target into the configured per-label repetition count.
         let repeat = if config.stress.is_stress() {
             config.stress
-        } else if labels.iter().any(|l| l.split_once(':').unwrap_or(("", l)).1 == "stress") {
+        } else if labels
+            .iter()
+            .any(|l| l.split_once(':').unwrap_or(("", l)).1 == "stress")
+        {
             RepeatKind::Stress(config.stress_label_reps)
         } else {
             RepeatKind::Once
@@ -361,7 +362,10 @@ impl TargetPlan {
             quarantine: policy::quarantine_status(labels),
             timeout: policy::test_timeout(labels).resolve(config.per_test_timeout),
             profile: profile_from_labels(labels).unwrap_or_else(|e| {
-                eprintln!("quokka: conflict resolving labels for {}: {}", spec.display, e);
+                eprintln!(
+                    "quokka: conflict resolving labels for {}: {}",
+                    spec.display, e
+                );
                 SchedulingProfile::default()
             }),
             owner: policy::owner(labels),
@@ -425,7 +429,7 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
     // target's tests as a green pass.
     let listing_outcome = match plan.translator.listing_strategy() {
         ListingStrategy::PerTestListing { request_args, .. } => {
-            let listing_args = (request_args)(plan.ignored);
+            let listing_args = (request_args)(plan.ignored, &config.extra_test_args);
             let mut infra_attempt = 0u32;
             let outcome = loop {
                 let request = build_listing_request(
@@ -464,10 +468,10 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
                 ignored: false,
             }]
         }
-        ListingStrategy::PerTestListing { parse, .. } => {
-            match listing_outcome {
-                Some(Ok(Execute2Outcome::Completed(action))) => match action.status {
-                    ProcessOutcome::Finished { exit_code: 0 } => match (parse)(&action.stdout, plan.ignored) {
+        ListingStrategy::PerTestListing { parse, .. } => match listing_outcome {
+            Some(Ok(Execute2Outcome::Completed(action))) => match action.status {
+                ProcessOutcome::Finished { exit_code: 0 } => {
+                    match (parse)(&action.stdout, plan.ignored) {
                         Ok(tests) => tests,
                         Err(e) => {
                             report_target_failure(
@@ -479,65 +483,60 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
                             .await;
                             return;
                         }
-                    },
-                    ProcessOutcome::Finished { exit_code } => {
-                        report_target_failure(
-                            ctx,
-                            &plan,
-                            TestVerdict::Fatal,
-                            format!(
-                                "listing exited {exit_code}\n{}",
-                                String::from_utf8_lossy(&action.stderr)
-                            ),
-                        )
-                        .await;
-                        return;
                     }
-                    ProcessOutcome::TimedOut { .. } => {
-                        report_target_failure(
-                            ctx,
-                            &plan,
-                            TestVerdict::Timeout,
-                            "listing timed out".into(),
-                        )
-                        .await;
-                        return;
-                    }
-                },
-                Some(Ok(Execute2Outcome::CancelledQueueTimeout)) => {
-                    report_target_failure(
-                        ctx,
-                        &plan,
-                        TestVerdict::InfraFailure,
-                        "listing RE queue timeout (retries exhausted)".into(),
-                    )
-                    .await;
-                    return;
                 }
-                Some(Ok(Execute2Outcome::CancelledUnspecified)) => {
-                    report_target_failure(
-                        ctx,
-                        &plan,
-                        TestVerdict::Omitted,
-                        "listing cancelled".into(),
-                    )
-                    .await;
-                    return;
-                }
-
-                Some(Err(e)) => {
+                ProcessOutcome::Finished { exit_code } => {
                     report_target_failure(
                         ctx,
                         &plan,
                         TestVerdict::Fatal,
-                        format!("listing RPC failed: {e:#}"),
+                        format!(
+                            "listing exited {exit_code}\n{}",
+                            String::from_utf8_lossy(&action.stderr)
+                        ),
                     )
                     .await;
                     return;
                 }
-                None => unreachable!(),
+                ProcessOutcome::TimedOut { .. } => {
+                    report_target_failure(
+                        ctx,
+                        &plan,
+                        TestVerdict::Timeout,
+                        "listing timed out".into(),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            Some(Ok(Execute2Outcome::CancelledQueueTimeout)) => {
+                report_target_failure(
+                    ctx,
+                    &plan,
+                    TestVerdict::InfraFailure,
+                    "listing RE queue timeout (retries exhausted)".into(),
+                )
+                .await;
+                return;
             }
-        }
+            Some(Ok(Execute2Outcome::CancelledUnspecified)) => {
+                report_target_failure(ctx, &plan, TestVerdict::Omitted, "listing cancelled".into())
+                    .await;
+                return;
+            }
+
+            Some(Err(e)) => {
+                report_target_failure(
+                    ctx,
+                    &plan,
+                    TestVerdict::Fatal,
+                    format!("listing RPC failed: {e:#}"),
+                )
+                .await;
+                return;
+            }
+            None => unreachable!(),
+        },
     };
 
     // ---- Shard filter (deterministic hash of target ⊕ test name) ----
@@ -553,7 +552,7 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
 
     // Report discovery of exactly this shard's tests (so reported >= discovered).
     let discovered: Vec<String> = kept.iter().map(|t| t.name.clone()).collect();
-    
+
     let discovered_tids: Vec<TestIdentity> = tests
         .iter()
         .map(|t| TestIdentity {
@@ -562,7 +561,10 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
             variant: config.variant.clone(),
         })
         .collect();
-    let _ = ctx.report_tx.send(ReporterMessage::Discovered(discovered_tids)).await;
+    let _ = ctx
+        .report_tx
+        .send(ReporterMessage::Discovered(discovered_tids))
+        .await;
 
     let _ = ctx
         .orch
@@ -573,8 +575,18 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
         )
         .await;
 
+    if config.libtest_list_only {
+        return;
+    }
+
     // ---- Batch + order (longest-first) ----
-    let execution_batches = build_batches(&plan.spec.display, &kept, config, &ctx.estimates, plan.translator.parser_capability());
+    let execution_batches = build_batches(
+        &plan.spec.display,
+        &kept,
+        config,
+        &ctx.estimates,
+        plan.translator.parser_capability(),
+    );
 
     // ---- Fan out actions (bounded, per-target permit) ----
     let per_target_sem = Arc::new(Semaphore::new(config.limits.max_inflight_per_target));
@@ -592,9 +604,19 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
             let expected_members = expected_members.clone();
             let per_target_sem = per_target_sem.clone();
             actions.spawn(async move {
-                let finished =
-                    execute_test_action(&ctx, &plan, selection, expected_members, repeat_index, per_target_sem).await;
-                 let _ = ctx.report_tx.send(ReporterMessage::Finished(finished)).await;
+                let finished = execute_test_action(
+                    &ctx,
+                    &plan,
+                    selection,
+                    expected_members,
+                    repeat_index,
+                    per_target_sem,
+                )
+                .await;
+                let _ = ctx
+                    .report_tx
+                    .send(ReporterMessage::Finished(finished))
+                    .await;
             });
         }
     }
@@ -663,7 +685,14 @@ fn build_batches(
         .iter()
         .map(|t| LocalBatchInput {
             name: t.name.to_owned(),
-            estimate: db.estimate(None, &TestIdentity { target: target.to_owned(), name: t.name.to_owned(), variant: config.variant.clone() }),
+            estimate: db.estimate(
+                None,
+                &TestIdentity {
+                    target: target.to_owned(),
+                    name: t.name.to_owned(),
+                    variant: config.variant.clone(),
+                },
+            ),
         })
         .collect();
 
@@ -673,7 +702,8 @@ fn build_batches(
     };
 
     use crate::batching::Batcher;
-    let mut batches: Vec<batching::TestSelection<String>> = batch_mode.partition(&inputs)
+    let mut batches: Vec<batching::TestSelection<String>> = batch_mode
+        .partition(&inputs)
         .into_iter()
         .map(|selection| match selection {
             batching::TestSelection::All => batching::TestSelection::All,
@@ -685,26 +715,36 @@ fn build_batches(
     // Longest-first by the heaviest member of each batch.
     batches.sort_by_key(|selection| {
         std::cmp::Reverse(match selection {
-            batching::TestSelection::All => {
-                tests
-                    .iter()
-                    .map(|t| {
-                        db.estimate(None, &TestIdentity { target: target.to_owned(), name: t.name.to_owned(), variant: config.variant.clone() })
-                            .weight_ms(UNSEEN_WEIGHT_MS)
-                    })
-                    .max()
-                    .unwrap_or(0)
-            }
-            batching::TestSelection::Explicit(group) => {
-                group
-                    .iter()
-                    .map(|n| {
-                        db.estimate(None, &TestIdentity { target: target.to_owned(), name: n.to_owned(), variant: config.variant.clone() })
-                            .weight_ms(UNSEEN_WEIGHT_MS)
-                    })
-                    .max()
-                    .unwrap_or(0)
-            }
+            batching::TestSelection::All => tests
+                .iter()
+                .map(|t| {
+                    db.estimate(
+                        None,
+                        &TestIdentity {
+                            target: target.to_owned(),
+                            name: t.name.to_owned(),
+                            variant: config.variant.clone(),
+                        },
+                    )
+                    .weight_ms(UNSEEN_WEIGHT_MS)
+                })
+                .max()
+                .unwrap_or(0),
+            batching::TestSelection::Explicit(group) => group
+                .iter()
+                .map(|n| {
+                    db.estimate(
+                        None,
+                        &TestIdentity {
+                            target: target.to_owned(),
+                            name: n.to_owned(),
+                            variant: config.variant.clone(),
+                        },
+                    )
+                    .weight_ms(UNSEEN_WEIGHT_MS)
+                })
+                .max()
+                .unwrap_or(0),
         })
     });
     batches
@@ -796,7 +836,10 @@ async fn run_group(
                 name: name.to_owned(),
                 variant: config.variant.clone(),
             };
-            if matches!(ctx.estimates.estimate(None, &test_id), crate::duration_db::DurationEstimate::Unseen) {
+            if matches!(
+                ctx.estimates.estimate(None, &test_id),
+                crate::duration_db::DurationEstimate::Unseen
+            ) {
                 has_unseen = true;
                 break;
             }
@@ -811,11 +854,9 @@ async fn run_group(
             caching = crate::caching::TestExecutionCaching::Disabled;
         }
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let exec_args = plan.translator.execution_args(
-            &name_refs,
-            plan.ignored,
-            &config.extra_test_args
-        );
+        let exec_args =
+            plan.translator
+                .execution_args(&name_refs, plan.ignored, &config.extra_test_args);
 
         let repeat_count = if plan.repeat.is_stress() {
             Some(u64::from(repeat_index))
@@ -858,7 +899,9 @@ async fn run_group(
             }
         };
         let request = build_testing_request(TestingRequest {
-            target: crate::proto::test::ConfiguredTargetHandle { id: plan.spec.handle.0 },
+            target: crate::proto::test::ConfiguredTargetHandle {
+                id: plan.spec.handle.0,
+            },
             suite: plan.spec.suite.clone(),
             testcases,
             cmd: crate::execution::build_cmd(&plan.spec, &exec_args),
@@ -890,13 +933,18 @@ async fn run_group(
             Ok(response) => match decode_response(response) {
                 Execute2Outcome::Completed(action) => {
                     return GroupOutcome::Observed {
-                        observations: plan.translator.parse_results(&action.stdout, &action.stderr),
+                        observations: plan
+                            .translator
+                            .parse_results(&action.stdout, &action.stderr),
                         raw: action.status,
                         execution_time: action.execution_time,
                         max_memory: action.max_memory_used_bytes,
                         fresh: action.exec_kind.is_fresh_run(),
                         env: match action.exec_kind {
-                            crate::result::ExecKind::RemoteExecuted | crate::result::ExecKind::RemoteCacheHit => crate::duration_db::Environment::Remote,
+                            crate::result::ExecKind::RemoteExecuted
+                            | crate::result::ExecKind::RemoteCacheHit => {
+                                crate::duration_db::Environment::Remote
+                            }
                             _ => crate::duration_db::Environment::Local,
                         },
                     };
@@ -978,8 +1026,13 @@ async fn execute_test_action(
                     plan.translator.listing_strategy(),
                     ListingStrategy::WholeTarget { .. } | ListingStrategy::WholeBinary { .. }
                 );
-                
-                let test_names: Vec<String> = if is_whole_target && !observations.is_empty() && pending.len() == 1 && (pending[0] == crate::translator::DOCTEST_RESULT_NAME || pending[0] == crate::translator::BINARY_RESULT_NAME) {
+
+                let test_names: Vec<String> = if is_whole_target
+                    && !observations.is_empty()
+                    && pending.len() == 1
+                    && (pending[0] == crate::translator::DOCTEST_RESULT_NAME
+                        || pending[0] == crate::translator::BINARY_RESULT_NAME)
+                {
                     observations.keys().cloned().collect()
                 } else {
                     pending.clone()
@@ -1079,10 +1132,18 @@ async fn execute_test_action(
                     name: name.to_owned(),
                     variant: ctx.config.variant.clone(),
                 };
-                ctx.estimates.flake(None, &test_id).map(|f| f.failures > 0).unwrap_or(false)
+                ctx.estimates
+                    .flake(None, &test_id)
+                    .map(|f| f.failures > 0)
+                    .unwrap_or(false)
             };
             let toml_attempts = if is_flake {
-                ctx.config.quokka_config.flaky_retry.as_ref().map(|c| c.attempts).unwrap_or(0)
+                ctx.config
+                    .quokka_config
+                    .flaky_retry
+                    .as_ref()
+                    .map(|c| c.attempts)
+                    .unwrap_or(0)
             } else {
                 0
             };
@@ -1100,7 +1161,9 @@ async fn execute_test_action(
         // Retries exhausted. Isolate a multi-member batch's remaining failures so
         // a crashed neighbour does not mis-attribute results to innocent members.
         let is_batched = expected_members.len() > 1;
-        if is_batched && ctx.config.batch_failure_policy == BatchFailurePolicy::RerunPerTestToIsolate {
+        if is_batched
+            && ctx.config.batch_failure_policy == BatchFailurePolicy::RerunPerTestToIsolate
+        {
             return isolate_failures(
                 ctx,
                 plan,
@@ -1349,7 +1412,14 @@ async fn report_target_failure(
         repeat: plan.repeat,
         repeat_index: 0,
     };
-    let result = build_test_result(&run_id, plan.spec.handle_proto(), status, None, details, None);
+    let result = build_test_result(
+        &run_id,
+        plan.spec.handle_proto(),
+        status,
+        None,
+        details,
+        None,
+    );
     let _ = ctx
         .report_tx
         .send(ReporterMessage::Finished(vec![FinishedTest {
@@ -1365,9 +1435,6 @@ async fn report_target_failure(
 
 /// Whole-target / whole-binary targets: no listing, one action (run all),
 /// reported as a single synthetic test (exit-code verdict). Honors stress.
-
-
-
 
 /// FNV-1a over bytes, used for deterministic shard/file-name derivation without
 /// RNG (which is unavailable in this environment and undesirable for determinism).

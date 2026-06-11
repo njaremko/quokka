@@ -31,6 +31,8 @@ struct Recorded {
     results: Vec<TestResult>,
     discovered: Vec<(String, Vec<String>)>,
     end_exit_code: Option<i32>,
+    /// Verbatim argv of every `Execute2(Listing)` action, in order.
+    listing_calls: Vec<Vec<String>>,
     /// Testcases of every `Execute2(Testing)` action, in order.
     testing_calls: Vec<Vec<String>>,
     /// How many times each test has appeared in a Testing action (for flaky-once).
@@ -56,6 +58,117 @@ struct MockBuck2 {
     /// keeping only the cached exit status). The verdict must come from the exit
     /// code, not the (absent) harness output.
     cache_replay: bool,
+}
+
+fn command_verbatim_args(req: &ExecuteRequest2) -> Vec<String> {
+    req.test_executable
+        .as_ref()
+        .map(|exec| {
+            exec.cmd
+                .iter()
+                .filter_map(|arg| {
+                    let content = arg.content.as_ref()?;
+                    match content.value.as_ref()? {
+                        quokka::proto::test::arg_value_content::Value::SpecValue(sv) => {
+                            match sv.value.as_ref()? {
+                                quokka::proto::test::external_runner_spec_value::Value::Verbatim(v) => {
+                                    Some(v.clone())
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn listed_tests<'a>(
+    test_events: &'a [(String, &'static str)],
+    cmd_args: &[String],
+) -> Vec<(&'a String, &'static str)> {
+    let mut filters = Vec::new();
+    let mut skips = Vec::new();
+    let mut exact = false;
+    let mut include_ignored = false;
+    let mut ignored_only = false;
+
+    let args = cmd_args
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if let Some(skip) = arg.strip_prefix("--skip=") {
+            skips.push(skip.to_owned());
+            i += 1;
+            continue;
+        }
+        match arg {
+            "--list" => i += 1,
+            "--exact" => {
+                exact = true;
+                i += 1;
+            }
+            "--include-ignored" => {
+                include_ignored = true;
+                i += 1;
+            }
+            "--ignored" => {
+                ignored_only = true;
+                i += 1;
+            }
+            "--skip" => {
+                if let Some(value) = args.get(i + 1) {
+                    skips.push((*value).to_owned());
+                }
+                i += 2;
+            }
+            "--format" | "--color" | "--test-threads" | "--logfile" | "--shuffle-seed" | "-Z" => {
+                i += 2;
+            }
+            flag if flag.starts_with("--format=")
+                || flag.starts_with("--color=")
+                || flag.starts_with("--test-threads=")
+                || flag.starts_with("--logfile=")
+                || flag.starts_with("--shuffle-seed=") =>
+            {
+                i += 1;
+            }
+            flag if flag.starts_with('-') => i += 1,
+            filter => {
+                filters.push(filter.to_owned());
+                i += 1;
+            }
+        }
+    }
+
+    test_events
+        .iter()
+        .filter(|(name, event)| {
+            let ignored = *event == "ignored";
+            let ignored_selected = if ignored_only {
+                ignored
+            } else {
+                include_ignored || !ignored
+            };
+            let filter_selected = filters.is_empty()
+                || filters.iter().any(|filter| {
+                    if exact {
+                        name == filter
+                    } else {
+                        name.contains(filter)
+                    }
+                });
+            let skipped = skips.iter().any(|skip| name.contains(skip));
+            ignored_selected && filter_selected && !skipped
+        })
+        .map(|(name, event)| (name, *event))
+        .collect()
 }
 
 fn inline_result(stdout: String, exit_code: i32) -> ExecuteResponse2 {
@@ -110,28 +223,33 @@ impl TestOrchestrator for MockBuck2 {
             .expect("stage");
         let response = match stage {
             test_stage::Item::Listing(_) => {
+                let cmd_args = command_verbatim_args(&req);
+                self.recorded
+                    .lock()
+                    .expect("recorded mutex poisoned")
+                    .listing_calls
+                    .push(cmd_args.clone());
                 // Answer with a libtest JSON listing of all known tests.
                 let mut out = String::from("{ \"type\": \"suite\", \"event\": \"discovery\" }\n");
-                for (name, _) in &self.test_events {
+                for (name, event) in listed_tests(&self.test_events, &cmd_args) {
+                    let kind = if event == "bench" {
+                        "benchmark"
+                    } else {
+                        "test"
+                    };
+                    let ignored = event == "ignored";
                     out.push_str(&format!(
-                        "{{ \"type\": \"test\", \"event\": \"discovered\", \"name\": \"{name}\", \"ignore\": false }}\n"
+                        "{{ \"type\": \"{kind}\", \"event\": \"discovered\", \"name\": \"{name}\", \"ignore\": {ignored} }}\n"
                     ));
                 }
                 inline_result(out, 0)
             }
             test_stage::Item::Testing(_testing) => {
+                let cmd_args = command_verbatim_args(&req);
                 let mut effective_testcases = Vec::new();
-                if let Some(exec) = req.test_executable.as_ref() {
-                    for arg in &exec.cmd {
-                        if let Some(content) = &arg.content {
-                            if let Some(quokka::proto::test::arg_value_content::Value::SpecValue(sv)) = &content.value {
-                                if let Some(quokka::proto::test::external_runner_spec_value::Value::Verbatim(v)) = &sv.value {
-                                    if self.test_events.iter().any(|(n, _)| n == v) {
-                                        effective_testcases.push(v.clone());
-                                    }
-                                }
-                            }
-                        }
+                for arg in &cmd_args {
+                    if self.test_events.iter().any(|(n, _)| n == arg) {
+                        effective_testcases.push(arg.clone());
                     }
                 }
                 if effective_testcases.is_empty() {
@@ -139,7 +257,8 @@ impl TestOrchestrator for MockBuck2 {
                 }
                 let mut rec = self.recorded.lock().expect("recorded mutex poisoned");
                 rec.testing_calls.push(effective_testcases.clone());
-                rec.disable_caching_calls.push(req.disable_test_execution_caching);
+                rec.disable_caching_calls
+                    .push(req.disable_test_execution_caching);
                 if self.cache_replay {
                     // Cache hit: exit 0, no streams. The runner must read PASS
                     // from the exit status alone (buck2 returns empty stdout).
@@ -176,7 +295,11 @@ impl TestOrchestrator for MockBuck2 {
                     } else {
                         canned
                     };
-                    if event == "failed" {
+                    if event == "bench" {
+                        out.push_str(&format!(
+                            "{{ \"type\": \"bench\", \"name\": \"{name}\", \"median\": 1.0, \"deviation\": 0.0 }}\n"
+                        ));
+                    } else if event == "failed" {
                         any_fail = true;
                         out.push_str(&format!(
                             "{{ \"type\": \"test\", \"name\": \"{name}\", \"event\": \"failed\", \"stdout\": \"boom\" }}\n"
@@ -443,6 +566,39 @@ async fn all_passing_yields_zero_exit() {
 }
 
 #[tokio::test]
+async fn libtest_filter_limits_discovery_and_scheduling() {
+    let events = vec![
+        ("alpha_one".to_string(), "ok"),
+        ("beta_two".to_string(), "ok"),
+        ("gamma_three".to_string(), "ok"),
+    ];
+    let (orch, recorded, _server) = mock_orchestrator(events).await;
+    let mut config = test_config();
+    config.extra_test_args = vec!["alpha".to_string()];
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    intake_tx
+        .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
+        .unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, config, test_context()).await;
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert_eq!(
+        rec.discovered,
+        vec![(
+            "root//rust/foo:foo".to_string(),
+            vec!["alpha_one".to_string()]
+        )]
+    );
+    assert_eq!(rec.testing_calls, vec![vec!["alpha_one".to_string()]]);
+    assert_eq!(rec.results.len(), 1);
+    assert_eq!(rec.results[0].name, "alpha_one");
+    assert_eq!(rec.results[0].status, TestStatus::Pass as i32);
+    assert_eq!(rec.end_exit_code, Some(0));
+}
+
+#[tokio::test]
 async fn target_batching_still_reports_each_test() {
     // Batch all tests into one Execute2; per-name decode must still produce a
     // result for every test.
@@ -601,11 +757,17 @@ async fn flake_db_records_each_fresh_attempt_not_just_the_folded_best() {
 
     let flaky_flake = db.flake(None, &flaky_id).unwrap();
     assert_eq!(flaky_flake.runs, 2, "flaky test should record 2 runs");
-    assert_eq!(flaky_flake.failures, 1, "flaky test should record 1 failure");
+    assert_eq!(
+        flaky_flake.failures, 1,
+        "flaky test should record 1 failure"
+    );
 
     let steady_flake = db.flake(None, &steady_id).unwrap();
     assert_eq!(steady_flake.runs, 1, "steady test should record 1 run");
-    assert_eq!(steady_flake.failures, 0, "steady test should record 0 failures");
+    assert_eq!(
+        steady_flake.failures, 0,
+        "steady test should record 0 failures"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -651,37 +813,47 @@ async fn unseen_then_seen_test_caching() {
     std::fs::create_dir_all(&temp_dir).unwrap();
 
     let events = vec![("a".to_string(), "ok")];
-    
+
     // First run: cold/empty database (unseen test)
     {
         let (orch, recorded, _server) = mock_orchestrator(events.clone()).await;
         let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
-        intake_tx.send(SpecEnvelope::Spec(Box::new(libtest_spec(1)))).unwrap();
+        intake_tx
+            .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
+            .unwrap();
         intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
-        
+
         let mut config = test_config();
         config.duration_db = Some(temp_dir.clone());
-        
+
         drive_to_completion(orch, intake_rx, config, test_context()).await;
         let rec = recorded.lock().expect("recorded mutex poisoned");
         assert!(!rec.disable_caching_calls.is_empty());
-        assert!(rec.disable_caching_calls[0], "expected caching disabled for unseen test");
+        assert!(
+            rec.disable_caching_calls[0],
+            "expected caching disabled for unseen test"
+        );
     }
 
     // Second run: database now contains the test (seen test)
     {
         let (orch, recorded, _server) = mock_orchestrator(events).await;
         let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
-        intake_tx.send(SpecEnvelope::Spec(Box::new(libtest_spec(1)))).unwrap();
+        intake_tx
+            .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
+            .unwrap();
         intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
-        
+
         let mut config = test_config();
         config.duration_db = Some(temp_dir.clone());
-        
+
         drive_to_completion(orch, intake_rx, config, test_context()).await;
         let rec = recorded.lock().expect("recorded mutex poisoned");
         assert!(!rec.disable_caching_calls.is_empty());
-        assert!(!rec.disable_caching_calls[0], "expected caching enabled for seen test");
+        assert!(
+            !rec.disable_caching_calls[0],
+            "expected caching enabled for seen test"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -712,13 +884,15 @@ attempts = 3
     {
         let (orch, _recorded, _server) = mock_orchestrator(events.clone()).await;
         let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
-        intake_tx.send(SpecEnvelope::Spec(Box::new(libtest_spec(1)))).unwrap();
+        intake_tx
+            .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
+            .unwrap();
         intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
-        
+
         let mut config = test_config();
         config.duration_db = Some(temp_db.clone());
         config.quokka_config = quokka::config::load_config_from_home(Some(temp_home.clone()));
-        
+
         drive_to_completion(orch, intake_rx, config, test_context()).await;
     }
 
@@ -727,19 +901,26 @@ attempts = 3
     // so it is known to flake. Thus, it should retry up to 3 times (from TOML config) and PASS.
     let events = vec![("a".to_string(), "ok")];
     {
-        let (orch, recorded, _server) = mock_orchestrator_full(events, None, Some("a".to_string()), false).await;
+        let (orch, recorded, _server) =
+            mock_orchestrator_full(events, None, Some("a".to_string()), false).await;
         let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
-        intake_tx.send(SpecEnvelope::Spec(Box::new(libtest_spec(1)))).unwrap();
+        intake_tx
+            .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
+            .unwrap();
         intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
-        
+
         let mut config = test_config();
         config.duration_db = Some(temp_db.clone());
         config.quokka_config = quokka::config::load_config_from_home(Some(temp_home.clone()));
-        
+
         drive_to_completion(orch, intake_rx, config, test_context()).await;
         let rec = recorded.lock().expect("recorded mutex poisoned");
         assert_eq!(rec.results.len(), 1);
-        assert_eq!(rec.results[0].status, TestStatus::Pass as i32, "should pass on retry");
+        assert_eq!(
+            rec.results[0].status,
+            TestStatus::Pass as i32,
+            "should pass on retry"
+        );
         assert_eq!(rec.testing_seen.get("a"), Some(&2), "should have run twice");
         assert_eq!(rec.end_exit_code, Some(0), "verdict should be PASS");
     }

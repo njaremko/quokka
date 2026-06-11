@@ -22,7 +22,9 @@ use clap::Parser;
 
 use crate::batching::{BatchFailurePolicy, BatchMode};
 use crate::listing::IgnoredPolicy;
-use crate::translator::{RunFormat, ListFormat};
+use crate::translator::{
+    ListFormat, RunFormat, libtest_user_ignored_policies, libtest_user_requests_listing_only,
+};
 use crate::variant::{RepeatKind, Variant};
 
 /// Outer flags buck2 passes before `--`.
@@ -73,6 +75,8 @@ struct TpxConfig {
 
     #[arg(long)]
     include_ignored: bool,
+    #[arg(long = "ignored")]
+    ignored: bool,
     #[arg(long)]
     ignored_only: bool,
 
@@ -133,6 +137,128 @@ struct TpxConfig {
     #[arg(long, default_value_t = 65_536)]
     cas_inline_limit: usize,
 
+    #[arg(long = "force-run-in-process")]
+    libtest_force_run_in_process: bool,
+    #[arg(long = "exclude-should-panic")]
+    libtest_exclude_should_panic: bool,
+    #[arg(long = "test")]
+    libtest_test: bool,
+    #[arg(long = "bench")]
+    libtest_bench: bool,
+    #[arg(long = "list")]
+    libtest_list: bool,
+    #[arg(long = "fail-fast")]
+    libtest_fail_fast: bool,
+    #[arg(short = 'h', long = "help")]
+    libtest_help: bool,
+    #[arg(long = "logfile")]
+    libtest_logfile: Option<String>,
+    #[arg(long = "no-capture", alias = "nocapture")]
+    libtest_no_capture: bool,
+    #[arg(long = "test-threads")]
+    libtest_test_threads: Option<String>,
+    #[arg(long = "skip")]
+    libtest_skip: Vec<String>,
+    #[arg(short = 'q', long = "quiet")]
+    libtest_quiet: bool,
+    #[arg(long = "exact")]
+    libtest_exact: bool,
+    #[arg(long = "color")]
+    libtest_color: Option<String>,
+    #[arg(long = "format")]
+    libtest_format: Option<String>,
+    #[arg(long = "show-output")]
+    libtest_show_output: bool,
+    #[arg(short = 'Z', value_name = "FLAG")]
+    libtest_unstable_options: Vec<String>,
+    #[arg(long = "report-time")]
+    libtest_report_time: bool,
+    #[arg(long = "ensure-time")]
+    libtest_ensure_time: bool,
+    #[arg(long = "shuffle")]
+    libtest_shuffle: bool,
+    #[arg(long = "shuffle-seed")]
+    libtest_shuffle_seed: Option<String>,
+    #[arg(value_name = "FILTER")]
+    libtest_filters: Vec<String>,
+}
+
+impl TpxConfig {
+    fn direct_libtest_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        args.extend(self.libtest_filters.iter().cloned());
+        if self.libtest_exact {
+            args.push("--exact".to_owned());
+        }
+        for skip in &self.libtest_skip {
+            args.push("--skip".to_owned());
+            args.push(skip.clone());
+        }
+        if self.libtest_force_run_in_process {
+            args.push("--force-run-in-process".to_owned());
+        }
+        if self.libtest_exclude_should_panic {
+            args.push("--exclude-should-panic".to_owned());
+        }
+        if self.libtest_test {
+            args.push("--test".to_owned());
+        }
+        if self.libtest_bench {
+            args.push("--bench".to_owned());
+        }
+        if self.libtest_list {
+            args.push("--list".to_owned());
+        }
+        if self.libtest_fail_fast {
+            args.push("--fail-fast".to_owned());
+        }
+        if self.libtest_help {
+            args.push("--help".to_owned());
+        }
+        if let Some(path) = &self.libtest_logfile {
+            args.push("--logfile".to_owned());
+            args.push(path.clone());
+        }
+        if self.libtest_no_capture {
+            args.push("--no-capture".to_owned());
+        }
+        if let Some(threads) = &self.libtest_test_threads {
+            args.push("--test-threads".to_owned());
+            args.push(threads.clone());
+        }
+        if self.libtest_quiet {
+            args.push("--quiet".to_owned());
+        }
+        if let Some(color) = &self.libtest_color {
+            args.push("--color".to_owned());
+            args.push(color.clone());
+        }
+        if let Some(format) = &self.libtest_format {
+            args.push("--format".to_owned());
+            args.push(format.clone());
+        }
+        if self.libtest_show_output {
+            args.push("--show-output".to_owned());
+        }
+        for flag in &self.libtest_unstable_options {
+            args.push("-Z".to_owned());
+            args.push(flag.clone());
+        }
+        if self.libtest_report_time {
+            args.push("--report-time".to_owned());
+        }
+        if self.libtest_ensure_time {
+            args.push("--ensure-time".to_owned());
+        }
+        if self.libtest_shuffle {
+            args.push("--shuffle".to_owned());
+        }
+        if let Some(seed) = &self.libtest_shuffle_seed {
+            args.push("--shuffle-seed".to_owned());
+            args.push(seed.clone());
+        }
+        args
+    }
 }
 
 /// How buck2 connected the runner's two service channels.
@@ -201,6 +327,7 @@ pub struct RunnerConfig {
     pub limits: SchedulerLimits,
     pub cas_inline_limit: usize,
     pub duration_db: Option<PathBuf>,
+    pub libtest_list_only: bool,
     pub extra_test_args: Vec<String>,
     pub extra_env: Vec<(String, String)>,
     pub quokka_config: crate::config::QuokkaConfig,
@@ -262,7 +389,11 @@ pub fn parse(argv: Vec<String>) -> Result<Invocation, CliError> {
 
     let transport = resolve_transport(&outer)?;
     let (config, context) = resolve_config(&outer, tpx)?;
-    Ok(Invocation { transport, config, context })
+    Ok(Invocation {
+        transport,
+        config,
+        context,
+    })
 }
 
 fn resolve_transport(outer: &OuterCli) -> Result<Transport, CliError> {
@@ -284,18 +415,32 @@ fn resolve_transport(outer: &OuterCli) -> Result<Transport, CliError> {
     }
 }
 
-fn resolve_config(outer: &OuterCli, tpx: TpxConfig) -> Result<(RunnerConfig, SessionContext), CliError> {
-    let ignored = match (tpx.include_ignored, tpx.ignored_only) {
-        (false, false) => IgnoredPolicy::ExcludeIgnored,
-        (true, false) => IgnoredPolicy::IncludeIgnored,
-        (false, true) => IgnoredPolicy::IgnoredOnly,
-        (true, true) => {
+fn resolve_config(
+    outer: &OuterCli,
+    tpx: TpxConfig,
+) -> Result<(RunnerConfig, SessionContext), CliError> {
+    let mut extra_test_args = tpx.test_arg.clone();
+    extra_test_args.extend(tpx.direct_libtest_args());
+
+    let mut ignored = IgnoredPolicy::ExcludeIgnored;
+    let mut ignored_policies = Vec::new();
+    if tpx.include_ignored {
+        ignored_policies.push(IgnoredPolicy::IncludeIgnored);
+    }
+    if tpx.ignored || tpx.ignored_only {
+        ignored_policies.push(IgnoredPolicy::IgnoredOnly);
+    }
+    ignored_policies.extend(libtest_user_ignored_policies(&extra_test_args));
+    for policy in ignored_policies {
+        if ignored == IgnoredPolicy::ExcludeIgnored {
+            ignored = policy;
+        } else if ignored != policy {
             return Err(CliError::InvalidValue {
                 field: "ignored",
-                value: "--include-ignored with --ignored-only".to_owned(),
+                value: "--include-ignored with --ignored".to_owned(),
             });
         }
-    };
+    }
 
     let list_format = match tpx.list_format.as_str() {
         "text" => ListFormat::Text,
@@ -398,7 +543,8 @@ fn resolve_config(outer: &OuterCli, tpx: TpxConfig) -> Result<(RunnerConfig, Ses
         limits: SchedulerLimits::default(),
         cas_inline_limit: tpx.cas_inline_limit,
         duration_db: tpx.duration_db,
-        extra_test_args: tpx.test_arg,
+        libtest_list_only: libtest_user_requests_listing_only(&extra_test_args),
+        extra_test_args,
         extra_env,
         quokka_config: crate::config::load_config(),
     };
@@ -539,6 +685,37 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, CliError::IgnoredOnlyNeedsJsonListing));
+    }
+
+    #[test]
+    fn standard_libtest_args_are_accepted_directly() {
+        let inv = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "alpha",
+            "--exact",
+            "--skip",
+            "beta",
+            "--no-capture",
+            "--ignored",
+        ]))
+        .unwrap();
+        assert_eq!(inv.config.ignored, IgnoredPolicy::IgnoredOnly);
+        assert_eq!(
+            inv.config.extra_test_args,
+            vec![
+                "alpha".to_owned(),
+                "--exact".to_owned(),
+                "--skip".to_owned(),
+                "beta".to_owned(),
+                "--no-capture".to_owned()
+            ]
+        );
     }
 
     #[test]

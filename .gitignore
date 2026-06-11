@@ -2,6 +2,7 @@
 /buck-out
 /target
 /third-party/target
+.prelude
 
 # reindeer's download cache (CARGO_HOME side-effect; not a build input). Crates
 # are fetched via http_archive at build time, so nothing under third-party is

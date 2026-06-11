@@ -21,7 +21,12 @@ pub trait Translator: Send + Sync {
     fn declares_executor_overrides(&self) -> bool;
     fn parser_capability(&self) -> DemuxCapability;
     fn listing_strategy(&self) -> ListingStrategy;
-    fn execution_args(&self, names: &[&str], ignored: IgnoredPolicy, user_args: &[String]) -> Vec<String>;
+    fn execution_args(
+        &self,
+        names: &[&str],
+        ignored: IgnoredPolicy,
+        user_args: &[String],
+    ) -> Vec<String>;
     fn parse_results(&self, stdout: &[u8], stderr: &[u8]) -> FxHashMap<String, PerTestObservation>;
 }
 
@@ -29,8 +34,10 @@ pub trait Translator: Send + Sync {
 pub enum ListingStrategy {
     /// List the target, then issue one (or one batched) execution per test.
     PerTestListing {
-        request_args: Box<dyn Fn(IgnoredPolicy) -> Vec<String> + Send + Sync>,
-        parse: Box<dyn Fn(&[u8], IgnoredPolicy) -> Result<Vec<TestCase>, ListingParseError> + Send + Sync>,
+        request_args: Box<dyn Fn(IgnoredPolicy, &[String]) -> Vec<String> + Send + Sync>,
+        parse: Box<
+            dyn Fn(&[u8], IgnoredPolicy) -> Result<Vec<TestCase>, ListingParseError> + Send + Sync,
+        >,
     },
     /// No listing; one execution covers the whole target, reported under `name`.
     WholeTarget { name: &'static str },
@@ -45,7 +52,10 @@ pub enum DemuxCapability {
 }
 
 pub struct TranslatorRegistry {
-    factories: FxHashMap<String, Box<dyn Fn(&crate::cli::RunnerConfig) -> Box<dyn Translator> + Send + Sync>>,
+    factories: FxHashMap<
+        String,
+        Box<dyn Fn(&crate::cli::RunnerConfig) -> Box<dyn Translator> + Send + Sync>,
+    >,
 }
 
 impl TranslatorRegistry {
@@ -64,9 +74,7 @@ impl TranslatorRegistry {
                 run_format: config.run_format,
             })
         });
-        reg.register("custom_test_v1", |_| {
-            Box::new(CustomBinaryTranslator)
-        });
+        reg.register("custom_test_v1", |_| Box::new(CustomBinaryTranslator));
         reg
     }
 
@@ -75,24 +83,45 @@ impl TranslatorRegistry {
         test_type: &str,
         factory: impl Fn(&crate::cli::RunnerConfig) -> Box<dyn Translator> + Send + Sync + 'static,
     ) {
-        self.factories.insert(test_type.to_owned(), Box::new(factory));
+        self.factories
+            .insert(test_type.to_owned(), Box::new(factory));
     }
 
-    pub fn resolve(&self, test_type: &str, config: &crate::cli::RunnerConfig) -> Option<Box<dyn Translator>> {
+    pub fn resolve(
+        &self,
+        test_type: &str,
+        config: &crate::cli::RunnerConfig,
+    ) -> Option<Box<dyn Translator>> {
         self.factories.get(test_type).map(|f| f(config))
     }
 }
 
-pub fn libtest_listing_args(ignored: IgnoredPolicy, format: ListFormat) -> Vec<String> {
+pub fn libtest_listing_args(
+    ignored: IgnoredPolicy,
+    format: ListFormat,
+    user_args: &[String],
+) -> Vec<String> {
+    let user_args = LibtestUserArgs::parse(user_args);
     let mut args: Vec<String> = match format {
         ListFormat::Text => vec!["--list".to_owned()],
-        ListFormat::Json => vec!["-Z".to_owned(), "unstable-options".to_owned(), "--list".to_owned(), "--format".to_owned(), "json".to_owned()],
+        ListFormat::Json => vec![
+            "-Z".to_owned(),
+            "unstable-options".to_owned(),
+            "--list".to_owned(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ],
     };
+    if format == ListFormat::Text && user_args.listing_needs_unstable {
+        args.push("-Z".to_owned());
+        args.push("unstable-options".to_owned());
+    }
     match ignored {
         IgnoredPolicy::ExcludeIgnored => {}
         IgnoredPolicy::IncludeIgnored => args.push("--include-ignored".to_owned()),
         IgnoredPolicy::IgnoredOnly => args.push("--ignored".to_owned()),
     }
+    args.extend(user_args.listing_args);
     args
 }
 
@@ -100,7 +129,9 @@ pub fn libtest_execution_args(
     names: &[&str],
     ignored: IgnoredPolicy,
     format: RunFormat,
+    user_args: &[String],
 ) -> Vec<String> {
+    let user_args = LibtestUserArgs::parse(user_args);
     let mut args: Vec<String> = names.iter().map(|s| s.to_string()).collect();
     args.push("--exact".to_owned());
     args.push("--test-threads=1".to_owned());
@@ -110,11 +141,14 @@ pub fn libtest_execution_args(
         IgnoredPolicy::IncludeIgnored => args.push("--include-ignored".to_owned()),
         IgnoredPolicy::IgnoredOnly => args.push("--ignored".to_owned()),
     }
-    if format == RunFormat::Json {
+    if format == RunFormat::Json || user_args.execution_needs_unstable {
         for flag in ["-Z", "unstable-options", "--format", "json"] {
-            args.push(flag.to_owned());
+            if format == RunFormat::Json || flag == "-Z" || flag == "unstable-options" {
+                args.push(flag.to_owned());
+            }
         }
     }
+    args.extend(user_args.per_test_execution_args);
     args
 }
 
@@ -135,7 +169,8 @@ pub fn parse_listing(
     stdout: &[u8],
     policy: IgnoredPolicy,
 ) -> Result<Vec<crate::listing::TestCase>, crate::listing::ListingParseError> {
-    let text = std::str::from_utf8(stdout).map_err(|_| crate::listing::ListingParseError::NotUtf8)?;
+    let text =
+        std::str::from_utf8(stdout).map_err(|_| crate::listing::ListingParseError::NotUtf8)?;
     let all = match format {
         ListFormat::Text => parse_text(text),
         ListFormat::Json => parse_json(text),
@@ -146,13 +181,15 @@ pub fn parse_listing(
         .collect())
 }
 
-/// Parse stable `--list` text: lines of `name: test`, ignoring the trailing
-/// `N tests, M benchmarks` summary and blank lines.
+/// Parse stable `--list` text: lines of `name: test` or `name: benchmark`,
+/// ignoring the trailing `N tests, M benchmarks` summary and blank lines.
 fn parse_text(text: &str) -> Vec<crate::listing::TestCase> {
     text.lines()
         .filter_map(|line| {
             let line = line.trim_end();
-            let name = line.strip_suffix(": test")?;
+            let name = line
+                .strip_suffix(": test")
+                .or_else(|| line.strip_suffix(": benchmark"))?;
             if name.is_empty() {
                 return None;
             }
@@ -184,7 +221,7 @@ fn parse_json(text: &str) -> Vec<crate::listing::TestCase> {
                 return None;
             }
             let event: JsonListEvent = serde_json::from_str(line).ok()?;
-            if event.kind != "test" {
+            if event.kind != "test" && event.kind != "benchmark" {
                 return None;
             }
             // discovery uses event=="discovered"; accept missing event too.
@@ -202,7 +239,9 @@ fn parse_json(text: &str) -> Vec<crate::listing::TestCase> {
 pub fn doctest_execution_args(
     ignored: IgnoredPolicy,
     format: RunFormat,
+    user_args: &[String],
 ) -> Vec<String> {
+    let user_args = LibtestUserArgs::parse(user_args);
     let mut args = vec![];
     args.push("--test-threads=1".to_owned());
     args.push("--color=never".to_owned());
@@ -211,11 +250,14 @@ pub fn doctest_execution_args(
         IgnoredPolicy::IncludeIgnored => args.push("--include-ignored".to_owned()),
         IgnoredPolicy::IgnoredOnly => args.push("--ignored".to_owned()),
     }
-    if format == RunFormat::Json {
+    if format == RunFormat::Json || user_args.execution_needs_unstable {
         for flag in ["-Z", "unstable-options", "--format", "json"] {
-            args.push(flag.to_owned());
+            if format == RunFormat::Json || flag == "-Z" || flag == "unstable-options" {
+                args.push(flag.to_owned());
+            }
         }
     }
+    args.extend(user_args.whole_target_execution_args);
     args
 }
 
@@ -250,39 +292,181 @@ pub struct PerTestObservation {
     pub details: String,
 }
 
-/// libtest options the runner pins itself in [`Translator::execution_args`]
-/// (`--test-threads=1`, `--color=never`, and — for JSON — `-Z unstable-options
-/// --format json`). Each takes a value, and libtest's getopts rejects a
-/// value-taking option supplied more than once, so a passthrough `--test-arg`
-/// repeating any of these makes every test process exit non-zero. They are also
-/// the runner's to own: parallelism is action-level fanout (never intra-binary),
-/// the output format is fixed by `--run-format`, and color is always disabled
-/// for deterministic captured output. Strip them — and their values — from
-/// user-supplied passthrough args so they can never collide.
-const RUNNER_CONTROLLED_VALUE_OPTS: &[&str] = &["--test-threads", "--format", "--color", "-Z"];
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct LibtestUserArgs {
+    listing_args: Vec<String>,
+    per_test_execution_args: Vec<String>,
+    whole_target_execution_args: Vec<String>,
+    ignored_policies: Vec<IgnoredPolicy>,
+    listing_only: bool,
+    listing_needs_unstable: bool,
+    execution_needs_unstable: bool,
+}
 
-/// Remove [`RUNNER_CONTROLLED_VALUE_OPTS`] (and their values, in both
-/// `--opt=value` and `--opt value` forms) from passthrough test args.
-pub fn strip_runner_controlled_args(args: Vec<String>) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut drop_next_value = false;
-    for arg in args {
-        if drop_next_value {
-            drop_next_value = false;
-            continue;
-        }
-        if let Some((name, _)) = arg.split_once('=') {
-            if RUNNER_CONTROLLED_VALUE_OPTS.contains(&name) {
+pub fn libtest_user_ignored_policies(args: &[String]) -> Vec<IgnoredPolicy> {
+    LibtestUserArgs::parse(args).ignored_policies
+}
+
+pub fn libtest_user_requests_listing_only(args: &[String]) -> bool {
+    LibtestUserArgs::parse(args).listing_only
+}
+
+impl LibtestUserArgs {
+    fn parse(args: &[String]) -> Self {
+        let mut parsed = Self::default();
+        let mut i = 0;
+        while i < args.len() {
+            let arg = args[i].as_str();
+            if let Some(value) = arg.strip_prefix("--skip=") {
+                parsed.push_skip(value);
+                i += 1;
                 continue;
             }
+            if let Some(value) = arg.strip_prefix("--logfile=") {
+                parsed.push_execution_value("--logfile", value);
+                i += 1;
+                continue;
+            }
+            if arg.starts_with("--test-threads=")
+                || arg.starts_with("--color=")
+                || arg.starts_with("--format=")
+            {
+                i += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--shuffle-seed=") {
+                parsed.push_unstable_execution_value("--shuffle-seed", value);
+                i += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("-Z") {
+                if value.is_empty() {
+                    if args.get(i + 1).is_some() {
+                        parsed.execution_needs_unstable = true;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    parsed.execution_needs_unstable = true;
+                    i += 1;
+                }
+                continue;
+            }
+
+            match arg {
+                "--include-ignored" => {
+                    parsed.ignored_policies.push(IgnoredPolicy::IncludeIgnored);
+                    i += 1;
+                }
+                "--ignored" => {
+                    parsed.ignored_policies.push(IgnoredPolicy::IgnoredOnly);
+                    i += 1;
+                }
+                "--exact" => {
+                    parsed.listing_args.push(arg.to_owned());
+                    parsed.whole_target_execution_args.push(arg.to_owned());
+                    i += 1;
+                }
+                "--skip" => {
+                    if let Some(value) = args.get(i + 1) {
+                        parsed.push_skip(value);
+                    }
+                    i += 2;
+                }
+                "--list" => {
+                    parsed.listing_only = true;
+                    i += 1;
+                }
+                "--test" | "--bench" => {
+                    parsed.push_listing_and_execution_flag(arg);
+                    i += 1;
+                }
+                "--exclude-should-panic" => {
+                    parsed.listing_needs_unstable = true;
+                    parsed.execution_needs_unstable = true;
+                    parsed.push_listing_and_execution_flag(arg);
+                    i += 1;
+                }
+                "--force-run-in-process" | "--no-capture" | "--nocapture" | "--show-output" => {
+                    parsed.push_execution_flag(arg);
+                    i += 1;
+                }
+                "--fail-fast" | "--report-time" | "--ensure-time" | "--shuffle" => {
+                    parsed.execution_needs_unstable = true;
+                    parsed.push_execution_flag(arg);
+                    i += 1;
+                }
+                "--shuffle-seed" => {
+                    if let Some(value) = args.get(i + 1) {
+                        parsed.push_unstable_execution_value(arg, value);
+                    }
+                    i += 2;
+                }
+                "--logfile" => {
+                    if let Some(value) = args.get(i + 1) {
+                        parsed.push_execution_value(arg, value);
+                    }
+                    i += 2;
+                }
+                "--test-threads" | "--color" | "--format" => {
+                    i += 2;
+                }
+                "-q" | "--quiet" | "-h" | "--help" => {
+                    i += 1;
+                }
+                "--" => {
+                    for filter in &args[i + 1..] {
+                        parsed.push_filter(filter);
+                    }
+                    break;
+                }
+                flag if flag.starts_with('-') => {
+                    parsed.push_execution_flag(flag);
+                    i += 1;
+                }
+                filter => {
+                    parsed.push_filter(filter);
+                    i += 1;
+                }
+            }
         }
-        if RUNNER_CONTROLLED_VALUE_OPTS.contains(&arg.as_str()) {
-            drop_next_value = true;
-            continue;
-        }
-        out.push(arg);
+        parsed
     }
-    out
+
+    fn push_filter(&mut self, value: &str) {
+        self.listing_args.push(value.to_owned());
+        self.whole_target_execution_args.push(value.to_owned());
+    }
+
+    fn push_skip(&mut self, value: &str) {
+        self.listing_args.push("--skip".to_owned());
+        self.listing_args.push(value.to_owned());
+        self.whole_target_execution_args.push("--skip".to_owned());
+        self.whole_target_execution_args.push(value.to_owned());
+    }
+
+    fn push_execution_flag(&mut self, flag: &str) {
+        self.per_test_execution_args.push(flag.to_owned());
+        self.whole_target_execution_args.push(flag.to_owned());
+    }
+
+    fn push_listing_and_execution_flag(&mut self, flag: &str) {
+        self.listing_args.push(flag.to_owned());
+        self.push_execution_flag(flag);
+    }
+
+    fn push_execution_value(&mut self, flag: &str, value: &str) {
+        self.per_test_execution_args.push(flag.to_owned());
+        self.per_test_execution_args.push(value.to_owned());
+        self.whole_target_execution_args.push(flag.to_owned());
+        self.whole_target_execution_args.push(value.to_owned());
+    }
+
+    fn push_unstable_execution_value(&mut self, flag: &str, value: &str) {
+        self.execution_needs_unstable = true;
+        self.push_execution_value(flag, value);
+    }
 }
 
 #[derive(Deserialize)]
@@ -309,6 +493,18 @@ fn decode_json(stdout: &str) -> FxHashMap<String, PerTestObservation> {
         let Ok(event) = serde_json::from_str::<RunEvent>(line) else {
             continue;
         };
+        if event.kind == "bench" {
+            if let Some(name) = event.name {
+                out.insert(
+                    name,
+                    PerTestObservation {
+                        status: TestVerdict::Pass,
+                        details: String::new(),
+                    },
+                );
+            }
+            continue;
+        }
         if event.kind != "test" {
             continue;
         }
@@ -340,12 +536,16 @@ fn decode_text(stdout: &str, stderr: &str) -> FxHashMap<String, PerTestObservati
         let Some((name, status_token)) = rest.rsplit_once(" ... ") else {
             continue;
         };
-        let status = match status_token.trim() {
-            "ok" => TestVerdict::Pass,
-            "FAILED" => TestVerdict::Fail,
-            "ignored" => TestVerdict::Skip,
-            // bench results and anything else: not a unit-test pass/fail.
-            _ => continue,
+        let status_token = status_token.trim();
+        let status = if status_token.starts_with("bench:") {
+            TestVerdict::Pass
+        } else {
+            match status_token.split_whitespace().next().unwrap_or_default() {
+                "ok" => TestVerdict::Pass,
+                "FAILED" => TestVerdict::Fail,
+                "ignored" => TestVerdict::Skip,
+                _ => continue,
+            }
         };
         let details = if status == TestVerdict::Fail {
             extract_failure_block(stdout, name).unwrap_or_else(|| {
@@ -384,19 +584,28 @@ pub struct LibtestTranslator {
 }
 
 impl Translator for LibtestTranslator {
-    fn declares_executor_overrides(&self) -> bool { false }
-    fn parser_capability(&self) -> DemuxCapability { DemuxCapability::NameAttributable }
+    fn declares_executor_overrides(&self) -> bool {
+        false
+    }
+    fn parser_capability(&self) -> DemuxCapability {
+        DemuxCapability::NameAttributable
+    }
     fn listing_strategy(&self) -> ListingStrategy {
         let list_format = self.list_format;
         ListingStrategy::PerTestListing {
-            request_args: Box::new(move |ignored| libtest_listing_args(ignored, list_format)),
+            request_args: Box::new(move |ignored, user_args| {
+                libtest_listing_args(ignored, list_format, user_args)
+            }),
             parse: Box::new(move |stdout, ignored| parse_listing(list_format, stdout, ignored)),
         }
     }
-    fn execution_args(&self, names: &[&str], ignored: IgnoredPolicy, user_args: &[String]) -> Vec<String> {
-        let mut args = libtest_execution_args(names, ignored, self.run_format);
-        args.extend(strip_runner_controlled_args(user_args.to_vec()));
-        args
+    fn execution_args(
+        &self,
+        names: &[&str],
+        ignored: IgnoredPolicy,
+        user_args: &[String],
+    ) -> Vec<String> {
+        libtest_execution_args(names, ignored, self.run_format, user_args)
     }
     fn parse_results(&self, stdout: &[u8], stderr: &[u8]) -> FxHashMap<String, PerTestObservation> {
         libtest_decode(self.run_format, stdout, stderr)
@@ -408,15 +617,24 @@ pub struct DoctestTranslator {
 }
 
 impl Translator for DoctestTranslator {
-    fn declares_executor_overrides(&self) -> bool { false }
-    fn parser_capability(&self) -> DemuxCapability { DemuxCapability::SingletonOnly }
-    fn listing_strategy(&self) -> ListingStrategy {
-        ListingStrategy::WholeTarget { name: DOCTEST_RESULT_NAME }
+    fn declares_executor_overrides(&self) -> bool {
+        false
     }
-    fn execution_args(&self, _names: &[&str], ignored: IgnoredPolicy, user_args: &[String]) -> Vec<String> {
-        let mut args = doctest_execution_args(ignored, self.run_format);
-        args.extend(strip_runner_controlled_args(user_args.to_vec()));
-        args
+    fn parser_capability(&self) -> DemuxCapability {
+        DemuxCapability::SingletonOnly
+    }
+    fn listing_strategy(&self) -> ListingStrategy {
+        ListingStrategy::WholeTarget {
+            name: DOCTEST_RESULT_NAME,
+        }
+    }
+    fn execution_args(
+        &self,
+        _names: &[&str],
+        ignored: IgnoredPolicy,
+        user_args: &[String],
+    ) -> Vec<String> {
+        doctest_execution_args(ignored, self.run_format, user_args)
     }
     fn parse_results(&self, stdout: &[u8], stderr: &[u8]) -> FxHashMap<String, PerTestObservation> {
         libtest_decode(self.run_format, stdout, stderr)
@@ -426,17 +644,80 @@ impl Translator for DoctestTranslator {
 pub struct CustomBinaryTranslator;
 
 impl Translator for CustomBinaryTranslator {
-    fn declares_executor_overrides(&self) -> bool { true }
-    fn parser_capability(&self) -> DemuxCapability { DemuxCapability::SingletonOnly }
-    fn listing_strategy(&self) -> ListingStrategy {
-        ListingStrategy::WholeBinary { name: BINARY_RESULT_NAME }
+    fn declares_executor_overrides(&self) -> bool {
+        true
     }
-    fn execution_args(&self, _names: &[&str], _ignored: IgnoredPolicy, user_args: &[String]) -> Vec<String> {
+    fn parser_capability(&self) -> DemuxCapability {
+        DemuxCapability::SingletonOnly
+    }
+    fn listing_strategy(&self) -> ListingStrategy {
+        ListingStrategy::WholeBinary {
+            name: BINARY_RESULT_NAME,
+        }
+    }
+    fn execution_args(
+        &self,
+        _names: &[&str],
+        _ignored: IgnoredPolicy,
+        user_args: &[String],
+    ) -> Vec<String> {
         let mut args = custom_binary_execution_args();
         args.extend(user_args.iter().cloned());
         args
     }
-    fn parse_results(&self, _stdout: &[u8], _stderr: &[u8]) -> FxHashMap<String, PerTestObservation> {
+    fn parse_results(
+        &self,
+        _stdout: &[u8],
+        _stderr: &[u8],
+    ) -> FxHashMap<String, PerTestObservation> {
         custom_binary_decode()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_benchmark_event_is_a_passing_observation() {
+        let output = r#"{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "bench_five" }
+{ "type": "bench", "name": "bench_five", "median": 1.0, "deviation": 0.0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 1, "filtered_out": 0 }
+"#;
+        let observations = libtest_decode(RunFormat::Json, output.as_bytes(), b"");
+        assert_eq!(
+            observations.get("bench_five"),
+            Some(&PerTestObservation {
+                status: TestVerdict::Pass,
+                details: String::new()
+            })
+        );
+    }
+
+    #[test]
+    fn text_benchmark_and_report_time_lines_are_passing_observations() {
+        let output = "\
+running 2 tests
+test alpha_one ... ok <0.001s>
+test bench_five ... bench:           1.78 ns/iter (+/- 0.83)
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 1 measured; 0 filtered out; finished in 0.00s
+";
+        let observations = libtest_decode(RunFormat::Text, output.as_bytes(), b"");
+        assert_eq!(
+            observations.get("alpha_one"),
+            Some(&PerTestObservation {
+                status: TestVerdict::Pass,
+                details: String::new()
+            })
+        );
+        assert_eq!(
+            observations.get("bench_five"),
+            Some(&PerTestObservation {
+                status: TestVerdict::Pass,
+                details: String::new()
+            })
+        );
     }
 }
