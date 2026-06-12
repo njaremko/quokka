@@ -30,13 +30,18 @@ impl IgnoredPolicy {
     }
 }
 
-
-
 /// A single discovered test.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestCase {
     pub name: String,
+    pub kind: TestCaseKind,
     pub ignored: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestCaseKind {
+    Test,
+    Benchmark,
 }
 
 #[derive(Debug, thiserror::Error)]

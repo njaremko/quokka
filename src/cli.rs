@@ -719,6 +719,23 @@ mod tests {
     }
 
     #[test]
+    fn buck_test_arg_equals_shape_is_passthrough() {
+        let inv = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--test-arg=--list",
+        ]))
+        .unwrap();
+        assert!(inv.config.libtest_list_only);
+        assert_eq!(inv.config.extra_test_args, vec!["--list".to_owned()]);
+    }
+
+    #[test]
     fn extra_env_is_parsed() {
         let inv = parse(argv(&[
             "runner",

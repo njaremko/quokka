@@ -10,7 +10,7 @@
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
-use crate::listing::{IgnoredPolicy, ListingParseError, TestCase};
+use crate::listing::{IgnoredPolicy, ListingParseError, TestCase, TestCaseKind};
 use crate::result::TestVerdict;
 
 /// Synthetic test name reported for whole-target / whole-binary runs.
@@ -187,14 +187,19 @@ fn parse_text(text: &str) -> Vec<crate::listing::TestCase> {
     text.lines()
         .filter_map(|line| {
             let line = line.trim_end();
-            let name = line
+            let (name, kind) = line
                 .strip_suffix(": test")
-                .or_else(|| line.strip_suffix(": benchmark"))?;
+                .map(|name| (name, TestCaseKind::Test))
+                .or_else(|| {
+                    line.strip_suffix(": benchmark")
+                        .map(|name| (name, TestCaseKind::Benchmark))
+                })?;
             if name.is_empty() {
                 return None;
             }
             Some(crate::listing::TestCase {
                 name: name.to_owned(),
+                kind,
                 ignored: false,
             })
         })
@@ -221,19 +226,62 @@ fn parse_json(text: &str) -> Vec<crate::listing::TestCase> {
                 return None;
             }
             let event: JsonListEvent = serde_json::from_str(line).ok()?;
-            if event.kind != "test" && event.kind != "benchmark" {
-                return None;
-            }
+            let kind = match event.kind.as_str() {
+                "test" => TestCaseKind::Test,
+                "benchmark" => TestCaseKind::Benchmark,
+                _ => return None,
+            };
             // discovery uses event=="discovered"; accept missing event too.
             if event.event.as_deref().is_some_and(|ev| ev != "discovered") {
                 return None;
             }
             Some(crate::listing::TestCase {
                 name: event.name?,
+                kind,
                 ignored: event.ignore,
             })
         })
         .collect()
+}
+
+pub fn libtest_list_output(user_args: &[String], tests: &[TestCase]) -> String {
+    match LibtestUserArgs::parse(user_args).list_output_format {
+        LibtestListOutputFormat::Text => libtest_text_list_output(tests),
+        LibtestListOutputFormat::Json => libtest_json_list_output(tests),
+    }
+}
+
+fn libtest_text_list_output(tests: &[TestCase]) -> String {
+    let mut out = String::new();
+    for test in tests {
+        out.push_str(&test.name);
+        out.push_str(match test.kind {
+            TestCaseKind::Test => ": test\n",
+            TestCaseKind::Benchmark => ": benchmark\n",
+        });
+    }
+    out
+}
+
+fn libtest_json_list_output(tests: &[TestCase]) -> String {
+    let mut out = String::new();
+    for test in tests {
+        let kind = match test.kind {
+            TestCaseKind::Test => "test",
+            TestCaseKind::Benchmark => "benchmark",
+        };
+        out.push_str(
+            &serde_json::json!({
+                "type": kind,
+                "event": "discovered",
+                "name": test.name,
+                "ignore": test.ignored,
+            })
+            .to_string(),
+        );
+        out.push('\n');
+    }
+    out
 }
 
 pub fn doctest_execution_args(
@@ -299,8 +347,16 @@ struct LibtestUserArgs {
     whole_target_execution_args: Vec<String>,
     ignored_policies: Vec<IgnoredPolicy>,
     listing_only: bool,
+    list_output_format: LibtestListOutputFormat,
     listing_needs_unstable: bool,
     execution_needs_unstable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LibtestListOutputFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 pub fn libtest_user_ignored_policies(args: &[String]) -> Vec<IgnoredPolicy> {
@@ -327,10 +383,12 @@ impl LibtestUserArgs {
                 i += 1;
                 continue;
             }
-            if arg.starts_with("--test-threads=")
-                || arg.starts_with("--color=")
-                || arg.starts_with("--format=")
-            {
+            if arg.starts_with("--test-threads=") || arg.starts_with("--color=") {
+                i += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--format=") {
+                parsed.set_list_output_format(value);
                 i += 1;
                 continue;
             }
@@ -409,7 +467,13 @@ impl LibtestUserArgs {
                     }
                     i += 2;
                 }
-                "--test-threads" | "--color" | "--format" => {
+                "--format" => {
+                    if let Some(value) = args.get(i + 1) {
+                        parsed.set_list_output_format(value);
+                    }
+                    i += 2;
+                }
+                "--test-threads" | "--color" => {
                     i += 2;
                 }
                 "-q" | "--quiet" | "-h" | "--help" => {
@@ -466,6 +530,12 @@ impl LibtestUserArgs {
     fn push_unstable_execution_value(&mut self, flag: &str, value: &str) {
         self.execution_needs_unstable = true;
         self.push_execution_value(flag, value);
+    }
+
+    fn set_list_output_format(&mut self, value: &str) {
+        if value == "json" {
+            self.list_output_format = LibtestListOutputFormat::Json;
+        }
     }
 }
 
@@ -677,6 +747,81 @@ impl Translator for CustomBinaryTranslator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn libtest_list_output_uses_stable_text_by_default() {
+        let tests = vec![
+            TestCase {
+                name: "alpha_one".to_owned(),
+                kind: TestCaseKind::Test,
+                ignored: false,
+            },
+            TestCase {
+                name: "bench_five".to_owned(),
+                kind: TestCaseKind::Benchmark,
+                ignored: false,
+            },
+        ];
+
+        assert_eq!(
+            libtest_list_output(&["--list".to_owned()], &tests),
+            "alpha_one: test\nbench_five: benchmark\n"
+        );
+    }
+
+    #[test]
+    fn libtest_list_output_can_emit_json() {
+        let tests = vec![TestCase {
+            name: "alpha_one".to_owned(),
+            kind: TestCaseKind::Test,
+            ignored: true,
+        }];
+
+        assert_eq!(
+            libtest_list_output(&["--list".to_owned(), "--format=json".to_owned()], &tests),
+            "{\"event\":\"discovered\",\"ignore\":true,\"name\":\"alpha_one\",\"type\":\"test\"}\n"
+        );
+    }
+
+    #[test]
+    fn listing_parse_preserves_test_case_kind() {
+        let text_cases = parse_listing(
+            ListFormat::Text,
+            b"alpha_one: test\nbench_five: benchmark\n",
+            IgnoredPolicy::ExcludeIgnored,
+        )
+        .unwrap();
+        assert_eq!(
+            text_cases,
+            vec![
+                TestCase {
+                    name: "alpha_one".to_owned(),
+                    kind: TestCaseKind::Test,
+                    ignored: false,
+                },
+                TestCase {
+                    name: "bench_five".to_owned(),
+                    kind: TestCaseKind::Benchmark,
+                    ignored: false,
+                },
+            ]
+        );
+
+        let json_cases = parse_listing(
+            ListFormat::Json,
+            br#"{ "type": "benchmark", "event": "discovered", "name": "bench_five", "ignore": false }"#,
+            IgnoredPolicy::ExcludeIgnored,
+        )
+        .unwrap();
+        assert_eq!(
+            json_cases,
+            vec![TestCase {
+                name: "bench_five".to_owned(),
+                kind: TestCaseKind::Benchmark,
+                ignored: false,
+            }]
+        );
+    }
 
     #[test]
     fn json_benchmark_event_is_a_passing_observation() {

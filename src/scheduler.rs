@@ -25,6 +25,7 @@
 //! guarantees `end_of_test_results` is sent on every exit path (see
 //! [`crate::run`]); this module only computes the exit code.
 
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,7 +51,9 @@ use crate::result::{
     build_test_result, decode_response,
 };
 use crate::spec::TargetSpec;
-use crate::translator::{ListingStrategy, PerTestObservation, Translator, TranslatorRegistry};
+use crate::translator::{
+    ListingStrategy, PerTestObservation, Translator, TranslatorRegistry, libtest_list_output,
+};
 use crate::variant::RepeatKind;
 
 const NONZERO_EXIT: i32 = 32;
@@ -465,6 +468,7 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
         ListingStrategy::WholeTarget { name } | ListingStrategy::WholeBinary { name } => {
             vec![TestCase {
                 name: (*name).to_string(),
+                kind: crate::listing::TestCaseKind::Test,
                 ignored: false,
             }]
         }
@@ -576,6 +580,7 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
         .await;
 
     if config.libtest_list_only {
+        emit_list_only_stdout(&config.extra_test_args, &kept);
         return;
     }
 
@@ -628,6 +633,20 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
             "a test action task panicked".into(),
         )
         .await;
+    }
+}
+
+fn emit_list_only_stdout(user_args: &[String], tests: &[crate::listing::TestCase]) {
+    let output = libtest_list_output(user_args, tests);
+    if output.is_empty() {
+        return;
+    }
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = stdout
+        .write_all(output.as_bytes())
+        .and_then(|_| stdout.flush())
+    {
+        eprintln!("quokka: failed to write list output: {e}");
     }
 }
 
