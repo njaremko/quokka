@@ -62,7 +62,7 @@ struct TpxConfig {
     env: Vec<String>,
 
     /// Extra verbatim args appended to every test command.
-    #[arg(long, num_args = 1.., allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true)]
     test_arg: Vec<String>,
 
     /// Default per-test timeout, seconds.
@@ -733,6 +733,63 @@ mod tests {
         .unwrap();
         assert!(inv.config.libtest_list_only);
         assert_eq!(inv.config.extra_test_args, vec!["--list".to_owned()]);
+    }
+
+    #[test]
+    fn buck_test_arg_space_shape_accepts_following_libtest_flags() {
+        let inv = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--test-arg",
+            "editor::formula_bar_f2_existing_reference_edges",
+            "--exact",
+            "--nocapture",
+        ]))
+        .unwrap();
+        assert_eq!(
+            inv.config.extra_test_args,
+            vec![
+                "editor::formula_bar_f2_existing_reference_edges".to_owned(),
+                "--exact".to_owned(),
+                "--no-capture".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_buck_test_arg_filter_shape_is_parsed_one_value_at_a_time() {
+        let inv = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--test-arg",
+            "--filter",
+            "--test-arg",
+            "editor::formula_bar_f2_existing_reference_edges",
+            "--test-arg",
+            "--exact",
+            "--test-arg",
+            "--nocapture",
+        ]))
+        .unwrap();
+        assert_eq!(
+            inv.config.extra_test_args,
+            vec![
+                "--filter".to_owned(),
+                "editor::formula_bar_f2_existing_reference_edges".to_owned(),
+                "--exact".to_owned(),
+                "--nocapture".to_owned()
+            ]
+        );
     }
 
     #[test]

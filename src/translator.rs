@@ -392,6 +392,11 @@ impl LibtestUserArgs {
                 i += 1;
                 continue;
             }
+            if let Some(value) = arg.strip_prefix("--filter=") {
+                parsed.push_filter(value);
+                i += 1;
+                continue;
+            }
             if let Some(value) = arg.strip_prefix("--shuffle-seed=") {
                 parsed.push_unstable_execution_value("--shuffle-seed", value);
                 i += 1;
@@ -435,6 +440,12 @@ impl LibtestUserArgs {
                 "--list" => {
                     parsed.listing_only = true;
                     i += 1;
+                }
+                "--filter" => {
+                    if let Some(value) = args.get(i + 1) {
+                        parsed.push_filter(value);
+                    }
+                    i += 2;
                 }
                 "--test" | "--bench" => {
                     parsed.push_listing_and_execution_flag(arg);
@@ -780,6 +791,60 @@ mod tests {
         assert_eq!(
             libtest_list_output(&["--list".to_owned(), "--format=json".to_owned()], &tests),
             "{\"event\":\"discovered\",\"ignore\":true,\"name\":\"alpha_one\",\"type\":\"test\"}\n"
+        );
+    }
+
+    #[test]
+    fn libtest_filter_flag_selects_listing_without_reaching_execution() {
+        let user_args = vec![
+            "--filter".to_owned(),
+            "alpha::one".to_owned(),
+            "--exact".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+
+        assert_eq!(
+            libtest_listing_args(IgnoredPolicy::ExcludeIgnored, ListFormat::Json, &user_args),
+            vec![
+                "-Z".to_owned(),
+                "unstable-options".to_owned(),
+                "--list".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+                "alpha::one".to_owned(),
+                "--exact".to_owned(),
+            ]
+        );
+        assert_eq!(
+            libtest_execution_args(
+                &["alpha::one"],
+                IgnoredPolicy::ExcludeIgnored,
+                RunFormat::Json,
+                &user_args,
+            ),
+            vec![
+                "alpha::one".to_owned(),
+                "--exact".to_owned(),
+                "--test-threads=1".to_owned(),
+                "--color=never".to_owned(),
+                "-Z".to_owned(),
+                "unstable-options".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+                "--nocapture".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn libtest_filter_equals_shape_selects_listing() {
+        assert_eq!(
+            libtest_listing_args(
+                IgnoredPolicy::ExcludeIgnored,
+                ListFormat::Text,
+                &["--filter=alpha".to_owned()],
+            ),
+            vec!["--list".to_owned(), "alpha".to_owned()]
         );
     }
 
