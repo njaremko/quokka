@@ -23,7 +23,8 @@ use clap::Parser;
 use crate::batching::{BatchFailurePolicy, BatchMode};
 use crate::listing::IgnoredPolicy;
 use crate::translator::{
-    ListFormat, RunFormat, libtest_user_ignored_policies, libtest_user_requests_listing_only,
+    ListFormat, RunFormat, libtest_user_ignored_policies, libtest_user_requests_help,
+    libtest_user_requests_listing_only, libtest_user_usage_error,
 };
 use crate::variant::{RepeatKind, Variant};
 
@@ -327,6 +328,8 @@ pub struct RunnerConfig {
     pub limits: SchedulerLimits,
     pub cas_inline_limit: usize,
     pub duration_db: Option<PathBuf>,
+    pub libtest_help_only: bool,
+    pub libtest_usage_error: Option<String>,
     pub libtest_list_only: bool,
     pub extra_test_args: Vec<String>,
     pub extra_env: Vec<(String, String)>,
@@ -543,6 +546,8 @@ fn resolve_config(
         limits: SchedulerLimits::default(),
         cas_inline_limit: tpx.cas_inline_limit,
         duration_db: tpx.duration_db,
+        libtest_help_only: libtest_user_requests_help(&extra_test_args),
+        libtest_usage_error: libtest_user_usage_error(&extra_test_args),
         libtest_list_only: libtest_user_requests_listing_only(&extra_test_args),
         extra_test_args,
         extra_env,
@@ -733,6 +738,78 @@ mod tests {
         .unwrap();
         assert!(inv.config.libtest_list_only);
         assert_eq!(inv.config.extra_test_args, vec!["--list".to_owned()]);
+    }
+
+    #[test]
+    fn libtest_help_is_a_runner_level_request() {
+        let inv = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--help",
+            "--format",
+            "json",
+        ]))
+        .unwrap();
+        assert!(inv.config.libtest_help_only);
+        assert_eq!(inv.config.libtest_usage_error, None);
+    }
+
+    #[test]
+    fn libtest_format_usage_errors_match_libtest() {
+        let json_without_unstable = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--format=json",
+        ]))
+        .unwrap();
+        assert_eq!(
+            json_without_unstable.config.libtest_usage_error.as_deref(),
+            Some(
+                "The \"json\" format is only accepted on the nightly compiler with -Z unstable-options"
+            )
+        );
+
+        let junit_with_unstable = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--format",
+            "junit",
+            "-Z",
+            "unstable-options",
+        ]))
+        .unwrap();
+        assert_eq!(junit_with_unstable.config.libtest_usage_error, None);
+
+        let invalid = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--format=nope",
+        ]))
+        .unwrap();
+        assert_eq!(
+            invalid.config.libtest_usage_error.as_deref(),
+            Some("argument for --format must be pretty, terse, json or junit (was nope)")
+        );
     }
 
     #[test]

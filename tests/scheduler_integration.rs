@@ -599,6 +599,53 @@ async fn libtest_filter_limits_discovery_and_scheduling() {
 }
 
 #[tokio::test]
+async fn libtest_help_prints_without_listing_or_running() {
+    let events = vec![("alpha_one".to_string(), "ok")];
+    let (orch, recorded, _server) = mock_orchestrator(events).await;
+    let mut config = test_config();
+    config.extra_test_args = vec!["--help".to_string()];
+    config.libtest_help_only = true;
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    intake_tx
+        .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
+        .unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, config, test_context()).await;
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert!(rec.listing_calls.is_empty());
+    assert!(rec.testing_calls.is_empty());
+    assert!(rec.results.is_empty());
+    assert_eq!(rec.end_exit_code, Some(0));
+}
+
+#[tokio::test]
+async fn libtest_usage_error_fails_without_listing_or_running() {
+    let events = vec![("alpha_one".to_string(), "ok")];
+    let (orch, recorded, _server) = mock_orchestrator(events).await;
+    let mut config = test_config();
+    config.extra_test_args = vec!["--format=json".to_string()];
+    config.libtest_usage_error = Some(
+        "The \"json\" format is only accepted on the nightly compiler with -Z unstable-options"
+            .to_string(),
+    );
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    intake_tx
+        .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
+        .unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, config, test_context()).await;
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert!(rec.listing_calls.is_empty());
+    assert!(rec.testing_calls.is_empty());
+    assert!(rec.results.is_empty());
+    assert_eq!(rec.end_exit_code, Some(32));
+}
+
+#[tokio::test]
 async fn target_batching_still_reports_each_test() {
     // Batch all tests into one Execute2; per-name decode must still produce a
     // result for every test.

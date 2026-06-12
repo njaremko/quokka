@@ -36,6 +36,33 @@ pub struct TestCase {
     pub name: String,
     pub kind: TestCaseKind,
     pub ignored: bool,
+    pub metadata: TestCaseMetadata,
+}
+
+impl TestCase {
+    pub fn new(name: String, kind: TestCaseKind, ignored: bool) -> Self {
+        Self {
+            name,
+            kind,
+            ignored,
+            metadata: TestCaseMetadata::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TestCaseMetadata {
+    pub ignore_message: Option<String>,
+    pub location: Option<TestCaseLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestCaseLocation {
+    pub source_path: String,
+    pub start_line: u64,
+    pub start_col: u64,
+    pub end_line: u64,
+    pub end_col: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

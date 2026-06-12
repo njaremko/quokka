@@ -52,7 +52,8 @@ use crate::result::{
 };
 use crate::spec::TargetSpec;
 use crate::translator::{
-    ListingStrategy, PerTestObservation, Translator, TranslatorRegistry, libtest_list_output,
+    ListingStrategy, PerTestObservation, Translator, TranslatorRegistry, libtest_help_output,
+    libtest_list_output,
 };
 use crate::variant::RepeatKind;
 
@@ -126,6 +127,17 @@ pub async fn run(
     config: RunnerConfig,
     context: crate::cli::SessionContext,
 ) -> i32 {
+    if config.libtest_help_only {
+        emit_libtest_help_stdout();
+        drain_intake(&mut intake).await;
+        return 0;
+    }
+    if let Some(error) = &config.libtest_usage_error {
+        eprintln!("error: {error}");
+        drain_intake(&mut intake).await;
+        return NONZERO_EXIT;
+    }
+
     let config = Arc::new(config);
     let global_sem = Arc::new(Semaphore::new(config.limits.max_inflight_test_actions));
     let listing_sem = Arc::new(Semaphore::new(config.limits.max_inflight_listings));
@@ -167,6 +179,14 @@ pub async fn run(
         verdict = RunVerdict::Fail;
     }
     verdict.exit_code()
+}
+
+async fn drain_intake(intake: &mut mpsc::UnboundedReceiver<SpecEnvelope>) {
+    while let Some(envelope) = intake.recv().await {
+        if matches!(envelope, SpecEnvelope::EndOfRequests) {
+            break;
+        }
+    }
 }
 
 /// Drain a [`JoinSet`], returning whether any task panicked or was cancelled. A
@@ -466,11 +486,11 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
 
     let tests = match plan.translator.listing_strategy() {
         ListingStrategy::WholeTarget { name } | ListingStrategy::WholeBinary { name } => {
-            vec![TestCase {
-                name: (*name).to_string(),
-                kind: crate::listing::TestCaseKind::Test,
-                ignored: false,
-            }]
+            vec![TestCase::new(
+                (*name).to_string(),
+                crate::listing::TestCaseKind::Test,
+                false,
+            )]
         }
         ListingStrategy::PerTestListing { parse, .. } => match listing_outcome {
             Some(Ok(Execute2Outcome::Completed(action))) => match action.status {
@@ -647,6 +667,17 @@ fn emit_list_only_stdout(user_args: &[String], tests: &[crate::listing::TestCase
         .and_then(|_| stdout.flush())
     {
         eprintln!("quokka: failed to write list output: {e}");
+    }
+}
+
+fn emit_libtest_help_stdout() {
+    let output = libtest_help_output("quokka");
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = stdout
+        .write_all(output.as_bytes())
+        .and_then(|_| stdout.flush())
+    {
+        eprintln!("quokka: failed to write help output: {e}");
     }
 }
 
