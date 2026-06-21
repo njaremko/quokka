@@ -62,6 +62,12 @@ struct TpxConfig {
     #[arg(long)]
     env: Vec<String>,
 
+    /// Declared output env, `--declared-output-env NAME=OUTPUT_DIR`, added to
+    /// every test action as an env var whose value is a Buck-declared output
+    /// directory.
+    #[arg(long = "declared-output-env")]
+    declared_output_env: Vec<String>,
+
     /// Extra verbatim args appended to every test command.
     #[arg(long, allow_hyphen_values = true)]
     test_arg: Vec<String>,
@@ -333,6 +339,7 @@ pub struct RunnerConfig {
     pub libtest_list_only: bool,
     pub extra_test_args: Vec<String>,
     pub extra_env: Vec<(String, String)>,
+    pub declared_output_env: Vec<(String, String)>,
     pub quokka_config: crate::config::QuokkaConfig,
 }
 
@@ -366,6 +373,10 @@ pub enum CliError {
     IgnoredOnlyNeedsJsonListing,
     #[error("invalid --env entry `{0}` (expected NAME=VALUE)")]
     InvalidEnv(String),
+    #[error(
+        "invalid --declared-output-env entry `{0}` (expected NAME=OUTPUT_DIR with both sides non-empty)"
+    )]
+    InvalidDeclaredOutputEnv(String),
     #[error("--shard-index {index} is out of range for --shard-count {count}")]
     ShardOutOfRange { index: u16, count: u16 },
     #[error(transparent)]
@@ -524,6 +535,16 @@ fn resolve_config(
         }
     }
 
+    let mut declared_output_env = Vec::with_capacity(tpx.declared_output_env.len());
+    for entry in &tpx.declared_output_env {
+        match entry.split_once('=') {
+            Some((k, v)) if !k.is_empty() && !v.is_empty() => {
+                declared_output_env.push((k.to_owned(), v.to_owned()))
+            }
+            _ => return Err(CliError::InvalidDeclaredOutputEnv(entry.clone())),
+        }
+    }
+
     let host_platform = outer
         .config_entry
         .iter()
@@ -551,6 +572,7 @@ fn resolve_config(
         libtest_list_only: libtest_user_requests_listing_only(&extra_test_args),
         extra_test_args,
         extra_env,
+        declared_output_env,
         quokka_config: crate::config::load_config(),
     };
 
@@ -887,6 +909,46 @@ mod tests {
             inv.config.extra_env,
             vec![("RUST_LOG".to_owned(), "debug".to_owned())]
         );
+    }
+
+    #[test]
+    fn declared_output_env_is_parsed() {
+        let inv = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--declared-output-env",
+            "NOBIE_RUST_TEST_ARTIFACTS_ROOT=rust-test-artifacts",
+        ]))
+        .unwrap();
+        assert_eq!(
+            inv.config.declared_output_env,
+            vec![(
+                "NOBIE_RUST_TEST_ARTIFACTS_ROOT".to_owned(),
+                "rust-test-artifacts".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn declared_output_env_rejects_empty_parts() {
+        let err = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--declared-output-env",
+            "=rust-test-artifacts",
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, CliError::InvalidDeclaredOutputEnv(_)));
     }
 
     #[test]

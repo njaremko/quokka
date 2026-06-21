@@ -955,7 +955,7 @@ async fn run_group(
             suite: plan.spec.suite.clone(),
             testcases,
             cmd: crate::execution::build_cmd(&plan.spec, &exec_args),
-            env: crate::execution::build_env(&plan.spec, &config.extra_env),
+            env: crate::execution::build_test_env(&plan.spec, &config.extra_env, &config.declared_output_env),
             variant: config.variant.identity(),
             repeat_count,
             profile: plan.testing_profile(config),

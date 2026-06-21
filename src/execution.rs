@@ -16,8 +16,8 @@ use crate::proto::test::external_runner_spec_value::Value as SpecValue;
 use crate::proto::test::test_stage::{Item as StageItem, Listing};
 use crate::proto::test::{
     ArgValue, ArgValueContent, ConfiguredTargetHandle, EnvironmentVariable, ExecuteRequest2,
-    ExecutorConfigOverride, ExternalRunnerSpecValue, LocalResourceType, TestExecutable, TestStage,
-    Testing,
+    ExecutorConfigOverride, ExternalRunnerSpecValue, LocalResourceType, OutputName, TestExecutable,
+    TestStage, Testing,
 };
 use crate::spec::{CommandArg, TargetSpec};
 
@@ -50,6 +50,17 @@ fn appended_verbatim(arg: &str) -> ArgValue {
     }
 }
 
+fn declared_output_value(output_name: &str) -> ArgValue {
+    ArgValue {
+        content: Some(ArgValueContent {
+            value: Some(ArgContent::DeclaredOutput(OutputName {
+                name: output_name.to_owned(),
+            })),
+        }),
+        format: None,
+    }
+}
+
 /// Build the full command: the spec's handles/verbatims first, then appended flags.
 pub fn build_cmd(spec: &TargetSpec, appended: &[String]) -> Vec<ArgValue> {
     let mut cmd = Vec::with_capacity(spec.command.len() + appended.len());
@@ -75,6 +86,21 @@ pub fn build_env(spec: &TargetSpec, extra: &[(String, String)]) -> Vec<Environme
         env.push(EnvironmentVariable {
             key: key.clone(),
             value: Some(appended_verbatim(value)),
+        });
+    }
+    env
+}
+
+pub fn build_test_env(
+    spec: &TargetSpec,
+    extra: &[(String, String)],
+    declared_output_env: &[(String, String)],
+) -> Vec<EnvironmentVariable> {
+    let mut env = build_env(spec, extra);
+    for (key, output_name) in declared_output_env {
+        env.push(EnvironmentVariable {
+            key: key.clone(),
+            value: Some(declared_output_value(output_name)),
         });
     }
     env
@@ -285,6 +311,48 @@ mod tests {
         // host sharing populated.
         assert!(req.host_sharing_requirements.is_some());
         assert!(!req.disable_test_execution_caching);
+    }
+
+    #[test]
+    fn declared_output_env_uses_buck_output_handle() {
+        let spec = spec_with_handle_command();
+        let declared_output_env = vec![(
+            "NOBIE_RUST_TEST_ARTIFACTS_ROOT".to_owned(),
+            "rust-test-artifacts".to_owned(),
+        )];
+        let req = build_testing_request(TestingRequest {
+            target: ConfiguredTargetHandle { id: spec.handle.0 },
+            suite: spec.suite.clone(),
+            testcases: vec!["m::t".into()],
+            cmd: build_cmd(&spec, &[]),
+            env: build_test_env(&spec, &[], &declared_output_env),
+            variant: Variant::Default.identity(),
+            repeat_count: None,
+            profile: SchedulingProfile::default(),
+            caching: crate::caching::TestExecutionCaching::Enabled,
+            timeout: std::time::Duration::from_secs(60),
+        });
+        let exec = req.test_executable.unwrap();
+        assert_eq!(exec.pre_create_dirs, Vec::new());
+        let artifact_root = exec
+            .env
+            .iter()
+            .find(|e| e.key == "NOBIE_RUST_TEST_ARTIFACTS_ROOT")
+            .expect("declared output env applied");
+        match &artifact_root
+            .value
+            .as_ref()
+            .unwrap()
+            .content
+            .as_ref()
+            .unwrap()
+            .value
+        {
+            Some(ArgContent::DeclaredOutput(OutputName { name })) => {
+                assert_eq!(name, "rust-test-artifacts")
+            }
+            _ => panic!("declared output env not encoded as declared output"),
+        }
     }
 
     #[test]
