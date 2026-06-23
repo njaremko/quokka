@@ -144,6 +144,16 @@ struct TpxConfig {
     #[arg(long, default_value_t = 65_536)]
     cas_inline_limit: usize,
 
+    /// Maximum test actions quokka may keep in flight across all targets.
+    #[arg(long, default_value_t = 2_000)]
+    max_inflight_test_actions: usize,
+
+    /// Maximum test actions quokka may keep in flight for one target. This is
+    /// separate from `--batch-mode`: per-test batching still cannot use more
+    /// remote workers than this target-local scheduler limit permits.
+    #[arg(long, default_value_t = 128)]
+    max_inflight_per_target: usize,
+
     #[arg(long = "force-run-in-process")]
     libtest_force_run_in_process: bool,
     #[arg(long = "exclude-should-panic")]
@@ -564,7 +574,11 @@ fn resolve_config(
         shard,
         local_debug: tpx.local_debug,
         flaky_attempts: tpx.flaky_attempts.max(1),
-        limits: SchedulerLimits::default(),
+        limits: SchedulerLimits {
+            max_inflight_test_actions: tpx.max_inflight_test_actions.max(1),
+            max_inflight_per_target: tpx.max_inflight_per_target.max(1),
+            ..SchedulerLimits::default()
+        },
         cas_inline_limit: tpx.cas_inline_limit,
         duration_db: tpx.duration_db,
         libtest_help_only: libtest_user_requests_help(&extra_test_args),
@@ -636,6 +650,31 @@ mod tests {
                 size: NonZeroUsize::new(32).unwrap()
             }
         );
+        // Scheduler concurrency limits fall back to their defaults.
+        assert_eq!(inv.config.limits.max_inflight_test_actions, 2_000);
+        assert_eq!(inv.config.limits.max_inflight_per_target, 128);
+    }
+
+    #[test]
+    fn inflight_limits_are_configurable_and_clamped() {
+        let inv = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "7",
+            "--orchestrator-fd",
+            "9",
+            "--",
+            "ignored",
+            "--max-inflight-test-actions",
+            "50",
+            "--max-inflight-per-target",
+            "0",
+        ]))
+        .unwrap();
+        assert_eq!(inv.config.limits.max_inflight_test_actions, 50);
+        // Zero would deadlock the scheduler (a semaphore with no permits), so it
+        // is clamped up to one.
+        assert_eq!(inv.config.limits.max_inflight_per_target, 1);
     }
 
     #[test]
