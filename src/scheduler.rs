@@ -843,6 +843,12 @@ enum GroupOutcome {
     Observed {
         observations: FxHashMap<String, PerTestObservation>,
         raw: ProcessOutcome,
+        /// Whether the action emitted any stdout. A cache replay drops stdout
+        /// (buck2 keeps only the cached exit status), so empty stdout means the
+        /// per-test output was dropped, not that the harness produced none. A
+        /// fresh run that DID emit stdout but yielded no parseable result for a
+        /// requested test lost or mangled its output (see `absent_name_verdict`).
+        produced_stdout: bool,
         execution_time: Duration,
         max_memory: Option<u64>,
         fresh: bool,
@@ -854,6 +860,49 @@ enum GroupOutcome {
         status: TestVerdict,
         details: String,
     },
+}
+
+/// Verdict for a requested test name that the harness produced no parsed result
+/// for. The exit code is the name's authoritative verdict in exactly two cases:
+///
+/// - `whole_unit`: the reconciled name is a synthetic whole-unit name
+///   (`<doctests>`/`<binary>`) whose verdict IS the process exit code — there is
+///   no per-test line to expect for it (an empty doc-test run, or a custom
+///   binary whose exit code is the whole result).
+/// - `!produced_stdout`: the action emitted no stdout at all. A cache replay
+///   drops stdout (buck2 keeps only the cached exit status), so an absent name
+///   on a clean cached exit genuinely passed.
+///
+/// Otherwise the run is a fresh per-test execution that DID emit stdout, yet we
+/// could not parse a result for this name — the harness output was not the JSON
+/// we expect, or this test's line was lost. A clean exit must NOT be read as a
+/// pass; we have no evidence the test passed, so it is FATAL. (Reading exit 0 as
+/// a pass here is the "non-JSON stdout silently passes" bug.)
+fn absent_name_verdict(
+    raw: ProcessOutcome,
+    whole_unit: bool,
+    produced_stdout: bool,
+    singleton: bool,
+) -> (TestVerdict, String) {
+    match raw {
+        ProcessOutcome::Finished { exit_code: 0 } if whole_unit || !produced_stdout => {
+            (TestVerdict::Pass, String::new())
+        }
+        ProcessOutcome::Finished { exit_code: 0 } => (
+            TestVerdict::Fatal,
+            "harness exited 0 but emitted no parseable result for this test".to_owned(),
+        ),
+        // A nonzero exit for a singleton is that test's failure; for a
+        // multi-member batch it cannot be attributed, so the member is FATAL and
+        // the caller's per-test isolation re-run resolves it with a precise
+        // singleton exit code.
+        ProcessOutcome::Finished { .. } if singleton => (TestVerdict::Fail, String::new()),
+        ProcessOutcome::Finished { .. } => (
+            TestVerdict::Fatal,
+            "test produced no result in batch output".to_owned(),
+        ),
+        ProcessOutcome::TimedOut { .. } => (TestVerdict::Timeout, "execution timed out".to_owned()),
+    }
 }
 
 /// Per-name best-so-far across attempts (pass-if-any-pass): once a test passes in
@@ -1017,6 +1066,7 @@ async fn run_group(
                         observations: plan
                             .translator
                             .parse_results(&action.stdout, &action.stderr),
+                        produced_stdout: !action.stdout.is_empty(),
                         raw: action.status,
                         execution_time: action.execution_time,
                         max_memory: action.max_memory_used_bytes,
@@ -1098,6 +1148,7 @@ async fn execute_test_action(
             GroupOutcome::Observed {
                 observations,
                 raw,
+                produced_stdout,
                 execution_time,
                 max_memory,
                 fresh,
@@ -1124,30 +1175,13 @@ async fn execute_test_action(
                 for name in &test_names {
                     let (status, details, from_harness) = match observations.get(name) {
                         Some(obs) => (obs.status, obs.details.clone(), true),
-                        // No harness line attributed this name. The exit status
-                        // is authoritative and survives result caching (buck2
-                        // drops stdout on a cache hit), so a clean exit means the
-                        // member passed. A nonzero exit for a singleton is that
-                        // test's failure; for a multi-member batch it cannot be
-                        // attributed, so the member is FATAL and the caller's
-                        // per-test isolation re-run resolves it with a precise
-                        // singleton exit code.
                         None => {
-                            let (status, details) = match raw {
-                                ProcessOutcome::Finished { exit_code: 0 } => {
-                                    (TestVerdict::Pass, String::new())
-                                }
-                                ProcessOutcome::Finished { .. } if singleton => {
-                                    (TestVerdict::Fail, String::new())
-                                }
-                                ProcessOutcome::Finished { .. } => (
-                                    TestVerdict::Fatal,
-                                    "test produced no result in batch output".to_owned(),
-                                ),
-                                ProcessOutcome::TimedOut { .. } => {
-                                    (TestVerdict::Timeout, "execution timed out".to_owned())
-                                }
-                            };
+                            let (status, details) = absent_name_verdict(
+                                raw,
+                                is_whole_target,
+                                produced_stdout,
+                                singleton,
+                            );
                             (status, details, false)
                         }
                     };
@@ -1606,6 +1640,79 @@ mod tests {
         };
         let summary = session_summary(&tally(), &context);
         assert!(!summary.contains("[host="), "got: {summary}");
+    }
+
+    fn verdict(
+        raw: ProcessOutcome,
+        whole_unit: bool,
+        produced_stdout: bool,
+        singleton: bool,
+    ) -> TestVerdict {
+        absent_name_verdict(raw, whole_unit, produced_stdout, singleton).0
+    }
+
+    #[test]
+    fn fresh_per_test_run_with_unparseable_output_is_never_a_pass() {
+        // The reported bug: a per-test (non-whole-unit) run that emitted stdout
+        // but no parseable result for this name must not be read as a pass on a
+        // clean exit — there is no evidence the test passed.
+        // verdict(raw, whole_unit, produced_stdout, singleton)
+        let fresh_garbage = ProcessOutcome::Finished { exit_code: 0 };
+        assert_eq!(verdict(fresh_garbage, false, true, true), TestVerdict::Fatal);
+        assert_eq!(verdict(fresh_garbage, false, true, false), TestVerdict::Fatal);
+        // The law, restated: never Pass in this region, for any exit code.
+        for exit_code in [0, 1, 101, -1] {
+            assert_ne!(
+                verdict(ProcessOutcome::Finished { exit_code }, false, true, true),
+                TestVerdict::Pass
+            );
+        }
+    }
+
+    #[test]
+    fn cache_replay_trusts_the_exit_code() {
+        // A cache replay drops stdout (produced_stdout == false); the cached exit
+        // status is authoritative, so an absent name on exit 0 passed.
+        assert_eq!(
+            verdict(ProcessOutcome::Finished { exit_code: 0 }, false, false, true),
+            TestVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn whole_unit_synthetic_name_trusts_the_exit_code() {
+        // For a synthetic <doctests>/<binary> name the exit code is the verdict,
+        // even on a fresh run that printed non-JSON stdout (e.g. a custom binary,
+        // or a doc-test target with zero doctests).
+        assert_eq!(
+            verdict(ProcessOutcome::Finished { exit_code: 0 }, true, true, true),
+            TestVerdict::Pass
+        );
+        assert_eq!(
+            verdict(ProcessOutcome::Finished { exit_code: 0 }, true, false, true),
+            TestVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_fails_a_singleton_and_fatals_an_unattributable_batch() {
+        let raw = ProcessOutcome::Finished { exit_code: 101 };
+        assert_eq!(verdict(raw, false, true, true), TestVerdict::Fail);
+        assert_eq!(verdict(raw, false, true, false), TestVerdict::Fatal);
+    }
+
+    #[test]
+    fn timeout_is_a_timeout_regardless_of_source() {
+        let raw = ProcessOutcome::TimedOut {
+            after: Duration::from_secs(1),
+        };
+        for &whole in &[true, false] {
+            for &produced in &[true, false] {
+                for &single in &[true, false] {
+                    assert_eq!(verdict(raw, whole, produced, single), TestVerdict::Timeout);
+                }
+            }
+        }
     }
 
     #[test]

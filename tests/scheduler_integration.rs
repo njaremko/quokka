@@ -58,6 +58,10 @@ struct MockBuck2 {
     /// keeping only the cached exit status). The verdict must come from the exit
     /// code, not the (absent) harness output.
     cache_replay: bool,
+    /// If true, every fresh Testing execution returns exit 0 with stdout that is
+    /// NOT the libtest JSON the runner expects. A fresh run that produced no
+    /// parseable per-test result must never be read as an all-pass.
+    garbage_stdout: bool,
 }
 
 fn command_verbatim_args(req: &ExecuteRequest2) -> Vec<String> {
@@ -265,6 +269,16 @@ impl TestOrchestrator for MockBuck2 {
                     drop(rec);
                     return Ok(Response::new(inline_result(String::new(), 0)));
                 }
+                if self.garbage_stdout {
+                    // A fresh run whose stdout is not the libtest JSON the runner
+                    // expects, yet exits 0. With no parseable per-test result, the
+                    // runner must NOT silently mark every test as passed.
+                    drop(rec);
+                    return Ok(Response::new(inline_result(
+                        "this is not json\nrandom harness noise\n".to_owned(),
+                        0,
+                    )));
+                }
                 let batch = effective_testcases.len() > 1;
                 let mut out = String::new();
                 let mut any_fail = false;
@@ -452,7 +466,7 @@ async fn mock_orchestrator(
     Arc<Mutex<Recorded>>,
     tokio::task::JoinHandle<()>,
 ) {
-    mock_orchestrator_full(test_events, None, None, false).await
+    mock_orchestrator_full(test_events, None, None, false, false).await
 }
 
 /// A mock that answers every Testing execution as a cache replay: exit 0 with
@@ -465,7 +479,19 @@ async fn mock_orchestrator_replay(
     Arc<Mutex<Recorded>>,
     tokio::task::JoinHandle<()>,
 ) {
-    mock_orchestrator_full(test_events, None, None, true).await
+    mock_orchestrator_full(test_events, None, None, true, false).await
+}
+
+/// A mock whose fresh Testing executions emit non-JSON stdout with exit 0, so a
+/// run that produced no parseable per-test result can be exercised.
+async fn mock_orchestrator_garbage(
+    test_events: Vec<(String, &'static str)>,
+) -> (
+    Orchestrator,
+    Arc<Mutex<Recorded>>,
+    tokio::task::JoinHandle<()>,
+) {
+    mock_orchestrator_full(test_events, None, None, false, true).await
 }
 
 async fn mock_orchestrator_full(
@@ -473,6 +499,7 @@ async fn mock_orchestrator_full(
     omit_in_batch: Option<String>,
     flaky_once: Option<String>,
     cache_replay: bool,
+    garbage_stdout: bool,
 ) -> (
     Orchestrator,
     Arc<Mutex<Recorded>>,
@@ -487,6 +514,7 @@ async fn mock_orchestrator_full(
         omit_in_batch,
         flaky_once,
         cache_replay,
+        garbage_stdout,
     };
     let router = tonic::transport::Server::builder().add_service(
         TestOrchestratorServer::new(mock)
@@ -563,6 +591,33 @@ async fn all_passing_yields_zero_exit() {
             .all(|r| r.status == TestStatus::Pass as i32)
     );
     assert_eq!(rec.end_exit_code, Some(0));
+}
+
+#[tokio::test]
+async fn nonjson_stdout_on_fresh_run_is_not_a_silent_pass() {
+    // A fresh libtest run whose stdout is not the expected JSON, yet exits 0,
+    // must never be reported as all-pass: with no parseable per-test result the
+    // runner has no evidence the tests passed. Each is FATAL and the run fails.
+    let events = vec![("alpha".to_string(), "ok"), ("beta".to_string(), "ok")];
+    let (orch, recorded, _server) = mock_orchestrator_garbage(events).await;
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    intake_tx
+        .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
+        .unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, test_config(), test_context()).await;
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert_eq!(rec.results.len(), 2, "one result per discovered test");
+    let statuses: Vec<i32> = rec.results.iter().map(|r| r.status).collect();
+    assert!(
+        rec.results
+            .iter()
+            .all(|r| r.status != TestStatus::Pass as i32),
+        "unparseable stdout on a fresh run must not pass; got {statuses:?}"
+    );
+    assert_ne!(rec.end_exit_code, Some(0), "the run must fail");
 }
 
 #[tokio::test]
@@ -678,7 +733,7 @@ async fn batch_isolation_reruns_missing_member_singly() {
     // so an innocent member is not mis-FATAL'd and the run is green.
     let events = vec![("x".to_string(), "ok"), ("y".to_string(), "ok")];
     let (orch, recorded, _server) =
-        mock_orchestrator_full(events, Some("y".to_string()), None, false).await;
+        mock_orchestrator_full(events, Some("y".to_string()), None, false, false).await;
     let mut config = test_config();
     config.batch_mode = quokka::batching::BatchMode::Target;
 
@@ -721,7 +776,7 @@ async fn flaky_member_passes_on_retry_without_failing_siblings() {
     // narrowed retry, yielding a green run.
     let events = vec![("p".to_string(), "ok"), ("f".to_string(), "ok")];
     let (orch, recorded, _server) =
-        mock_orchestrator_full(events, None, Some("f".to_string()), false).await;
+        mock_orchestrator_full(events, None, Some("f".to_string()), false, false).await;
     let mut config = test_config();
     config.batch_mode = quokka::batching::BatchMode::Target;
 
@@ -775,7 +830,7 @@ async fn flake_db_records_each_fresh_attempt_not_just_the_folded_best() {
 
     let events = vec![("steady".to_string(), "ok"), ("flaky".to_string(), "ok")];
     let (orch, _recorded, _server) =
-        mock_orchestrator_full(events, None, Some("flaky".to_string()), false).await;
+        mock_orchestrator_full(events, None, Some("flaky".to_string()), false, false).await;
     let mut config = test_config();
     config.duration_db = Some(dir.clone());
 
@@ -949,7 +1004,7 @@ attempts = 3
     let events = vec![("a".to_string(), "ok")];
     {
         let (orch, recorded, _server) =
-            mock_orchestrator_full(events, None, Some("a".to_string()), false).await;
+            mock_orchestrator_full(events, None, Some("a".to_string()), false, false).await;
         let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
         intake_tx
             .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
