@@ -39,6 +39,11 @@ pub struct TargetSpec {
     pub suite: String,
     /// Human-readable `cell//package:target` for result names and logs.
     pub display: String,
+    /// The configured target platform the test was built for (buck2's
+    /// `ConfiguredTarget.configuration`). `None` when buck2 sends an empty
+    /// configuration. Distinct from the session-wide host platform the runner
+    /// executes on (`SessionContext::host_platform`).
+    pub target_platform: Option<String>,
     /// The provider's `type` field (selects the translator).
     pub test_type: String,
     /// Base command: verbatim args and opaque handles, echoed back unmodified.
@@ -64,6 +69,11 @@ impl TargetSpec {
         let target = spec.target.ok_or(SpecError::MissingTarget)?;
         let handle = target.handle.ok_or(SpecError::MissingHandle)?;
         let display = format!("{}//{}:{}", target.cell, target.package, target.target);
+        let target_platform = if target.configuration.is_empty() {
+            None
+        } else {
+            Some(target.configuration)
+        };
 
         let labels = spec.labels;
 
@@ -86,6 +96,7 @@ impl TargetSpec {
             handle: TargetHandle(handle.id),
             suite: display.clone(),
             display,
+            target_platform,
             test_type: spec.test_type,
             command,
             env: env.into_boxed_slice(),
@@ -148,6 +159,7 @@ mod tests {
         assert_eq!(parsed.handle, TargetHandle(42));
         assert_eq!(parsed.suite, "root//rust/foo:foo");
         assert_eq!(parsed.display, "root//rust/foo:foo");
+        assert_eq!(parsed.target_platform.as_deref(), Some("cfg"));
         assert_eq!(parsed.test_type, "rust");
         assert_eq!(parsed.command.len(), 2);
         // env sorted: ABLE before ZED.
@@ -155,6 +167,33 @@ mod tests {
         assert_eq!(parsed.env[1].0, "ZED");
         assert_eq!(parsed.labels.len(), 2);
         assert_eq!(parsed.labels[0], "rust:flaky");
+    }
+
+    #[test]
+    fn empty_configuration_yields_no_target_platform() {
+        // buck2 always sends a `configuration` string, but an empty one carries
+        // no target platform — model that as `None` rather than `Some("")`.
+        let spec = ExternalRunnerSpec {
+            target: Some(ConfiguredTarget {
+                handle: Some(ConfiguredTargetHandle { id: 1 }),
+                cell: "root".into(),
+                package: "p".into(),
+                target: "t".into(),
+                configuration: String::new(),
+                package_project_relative_path: "p".into(),
+                test_config_unification_rollout: false,
+                package_oncall: None,
+            }),
+            test_type: "rust".into(),
+            command: vec![verbatim("./t")],
+            env: HashMap::new(),
+            labels: vec![],
+            contacts: vec![],
+            oncall: None,
+            working_dir_cell: "root".into(),
+        };
+        let parsed = TargetSpec::from_proto(spec).unwrap();
+        assert_eq!(parsed.target_platform, None);
     }
 
     #[test]

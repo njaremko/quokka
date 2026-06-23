@@ -320,8 +320,8 @@ fn session_summary(tally: &Tally, context: &crate::cli::SessionContext) -> Strin
             tally.quarantined_failed
         ));
     }
-    if let Some(platform) = &context.host_platform {
-        s.push_str(&format!(" [platform={platform}]"));
+    if let Some(host) = &context.host_platform {
+        s.push_str(&format!(" [host={host}]"));
     }
     if let Some(trace) = &context.trace_id {
         s.push_str(&format!(" [trace={trace}]"));
@@ -1341,12 +1341,16 @@ async fn make_finished(
 }
 
 /// Routing/owner/flake annotation appended to a failing test's details, e.g.
-/// `[brtr: target=root//rust/foo:foo | owner=spreadsheets | oncall=sheets |
+/// `[brtr: target=root//rust/foo:foo | target_platform=cfg:macos-arm64 |
+/// owner=spreadsheets | oncall=sheets |
 /// flaky_history: failed 4/20 recent runs, last=Timeout]`. Flake data is read
 /// from the pre-run snapshot. Only failures are annotated (by the caller), so
 /// passing-test output stays clean.
 fn failure_annotation(plan: &TargetPlan, ctx: &TargetCtx, test_id: &TestIdentity) -> String {
     let mut parts: Vec<String> = vec![format!("target={}", plan.spec.display)];
+    if let Some(target_platform) = &plan.spec.target_platform {
+        parts.push(format!("target_platform={target_platform}"));
+    }
     if let Owner::Team(team) = &plan.owner {
         parts.push(format!("owner={team}"));
     }
@@ -1495,4 +1499,42 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::SessionContext;
+
+    fn tally() -> Tally {
+        Tally {
+            total: 2,
+            passed: 1,
+            failed: 1,
+            quarantined_failed: 0,
+            skipped: 0,
+        }
+    }
+
+    #[test]
+    fn summary_labels_the_host_platform() {
+        // The session-wide platform the runner executes on is rendered as
+        // `[host=…]`, distinct from a target's build-for platform.
+        let context = SessionContext {
+            host_platform: Some("mac".to_owned()),
+            trace_id: None,
+        };
+        let summary = session_summary(&tally(), &context);
+        assert!(summary.ends_with(" [host=mac]"), "got: {summary}");
+    }
+
+    #[test]
+    fn summary_omits_host_platform_when_absent() {
+        let context = SessionContext {
+            host_platform: None,
+            trace_id: None,
+        };
+        let summary = session_summary(&tally(), &context);
+        assert!(!summary.contains("[host="), "got: {summary}");
+    }
 }

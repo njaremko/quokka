@@ -244,6 +244,7 @@ mod tests {
             handle: crate::ids::TargetHandle(9),
             suite: "foo".into(),
             display: "root//x:foo".into(),
+            target_platform: None,
             test_type: "rust".into(),
             command: vec![
                 CommandArg::ArgHandle(3),
