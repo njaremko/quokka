@@ -849,6 +849,10 @@ enum GroupOutcome {
         /// fresh run that DID emit stdout but yielded no parseable result for a
         /// requested test lost or mangled its output (see `absent_name_verdict`).
         produced_stdout: bool,
+        /// Bounded tail of the action's stderr. Used to explain a synthesized
+        /// (no-result) failure: an aborted test's panic message lands here, not
+        /// in any parseable harness result.
+        stderr: String,
         execution_time: Duration,
         max_memory: Option<u64>,
         fresh: bool,
@@ -878,11 +882,47 @@ enum GroupOutcome {
 /// we expect, or this test's line was lost. A clean exit must NOT be read as a
 /// pass; we have no evidence the test passed, so it is FATAL. (Reading exit 0 as
 /// a pass here is the "non-JSON stdout silently passes" bug.)
+/// Cap on the action stderr retained to explain a synthesized (no-result)
+/// failure. A panic message plus a short backtrace is a few KiB; this bounds a
+/// pathologically chatty test from inflating the retained tail.
+const ABSENT_FAILURE_STDERR_TAIL_MAX_BYTES: usize = 64 * 1024;
+
+/// Last `max_bytes` of an action's stderr as a lossy string (the whole thing when
+/// smaller), prefixed with an elision marker on truncation. The panic line a Rust
+/// process prints on abort sits near the end of stderr, so the tail is what
+/// carries the failure reason.
+fn bounded_stderr_tail(bytes: &[u8], max_bytes: usize) -> String {
+    if bytes.len() <= max_bytes {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let tail = &bytes[bytes.len() - max_bytes..];
+    format!(
+        "…[stderr truncated to last {max_bytes} bytes]\n{}",
+        String::from_utf8_lossy(tail)
+    )
+}
+
+/// Combine a synthesized-verdict explanation with the action's stderr. A test
+/// that aborts (panic = abort, or a panic on a non-test thread that `catch_unwind`
+/// cannot intercept) emits no per-test harness result, so its verdict is derived
+/// from the exit code — but the panic message it wrote to stderr is the actual
+/// failure reason and must not be dropped. Returns the reason alone when stderr is
+/// empty.
+fn absent_failure_details(reason: &str, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        reason.to_owned()
+    } else {
+        format!("{reason}\n---- action stderr ----\n{stderr}")
+    }
+}
+
 fn absent_name_verdict(
     raw: ProcessOutcome,
     whole_unit: bool,
     produced_stdout: bool,
     singleton: bool,
+    stderr: &str,
 ) -> (TestVerdict, String) {
     match raw {
         ProcessOutcome::Finished { exit_code: 0 } if whole_unit || !produced_stdout => {
@@ -890,16 +930,27 @@ fn absent_name_verdict(
         }
         ProcessOutcome::Finished { exit_code: 0 } => (
             TestVerdict::Fatal,
-            "harness exited 0 but emitted no parseable result for this test".to_owned(),
+            absent_failure_details(
+                "harness exited 0 but emitted no parseable result for this test",
+                stderr,
+            ),
         ),
         // A nonzero exit for a singleton is that test's failure; for a
         // multi-member batch it cannot be attributed, so the member is FATAL and
         // the caller's per-test isolation re-run resolves it with a precise
-        // singleton exit code.
-        ProcessOutcome::Finished { .. } if singleton => (TestVerdict::Fail, String::new()),
+        // singleton exit code. In both cases the process emitted no parseable
+        // result, so the only record of *why* is the stderr it wrote before
+        // exiting — surface it instead of an empty detail.
+        ProcessOutcome::Finished { exit_code } if singleton => (
+            TestVerdict::Fail,
+            absent_failure_details(
+                &format!("test process exited {exit_code} with no harness-reported result"),
+                stderr,
+            ),
+        ),
         ProcessOutcome::Finished { .. } => (
             TestVerdict::Fatal,
-            "test produced no result in batch output".to_owned(),
+            absent_failure_details("test produced no result in batch output", stderr),
         ),
         ProcessOutcome::TimedOut { .. } => (TestVerdict::Timeout, "execution timed out".to_owned()),
     }
@@ -1067,6 +1118,10 @@ async fn run_group(
                             .translator
                             .parse_results(&action.stdout, &action.stderr),
                         produced_stdout: !action.stdout.is_empty(),
+                        stderr: bounded_stderr_tail(
+                            &action.stderr,
+                            ABSENT_FAILURE_STDERR_TAIL_MAX_BYTES,
+                        ),
                         raw: action.status,
                         execution_time: action.execution_time,
                         max_memory: action.max_memory_used_bytes,
@@ -1149,6 +1204,7 @@ async fn execute_test_action(
                 observations,
                 raw,
                 produced_stdout,
+                stderr,
                 execution_time,
                 max_memory,
                 fresh,
@@ -1181,6 +1237,7 @@ async fn execute_test_action(
                                 is_whole_target,
                                 produced_stdout,
                                 singleton,
+                                &stderr,
                             );
                             (status, details, false)
                         }
@@ -1648,7 +1705,38 @@ mod tests {
         produced_stdout: bool,
         singleton: bool,
     ) -> TestVerdict {
-        absent_name_verdict(raw, whole_unit, produced_stdout, singleton).0
+        absent_name_verdict(raw, whole_unit, produced_stdout, singleton, "").0
+    }
+
+    #[test]
+    fn absent_singleton_failure_surfaces_action_stderr() {
+        // A singleton test that aborts (panic = abort, or a panic on a worker
+        // thread that `catch_unwind` cannot intercept) emits no per-test harness
+        // result, so its verdict is synthesized from the nonzero exit. The panic
+        // message — the actual failure reason — is on the action's stderr and must
+        // be surfaced, not dropped to an empty detail (which left `buck2 test`
+        // printing a bare "✗ Fail" with no cause).
+        let raw = ProcessOutcome::Finished { exit_code: 134 }; // SIGABRT
+        let stderr = "thread 'main' panicked at regression.rs:6171:9:\n\
+                      step 61 getCellValueText {row=0,col=0} expected \"1\" but got \"\"";
+        let (status, details) = absent_name_verdict(raw, false, true, true, stderr);
+        assert_eq!(status, TestVerdict::Fail);
+        assert!(
+            details.contains("getCellValueText {row=0,col=0} expected"),
+            "failure detail must carry the action stderr; got: {details:?}"
+        );
+        assert!(details.contains("---- action stderr ----"), "got: {details:?}");
+    }
+
+    #[test]
+    fn absent_singleton_failure_without_stderr_is_still_explained() {
+        // With no stderr the synthesized failure still names the exit code rather
+        // than reporting an empty detail.
+        let raw = ProcessOutcome::Finished { exit_code: 101 };
+        let (status, details) = absent_name_verdict(raw, false, true, true, "");
+        assert_eq!(status, TestVerdict::Fail);
+        assert!(!details.is_empty(), "got: {details:?}");
+        assert!(details.contains("101"), "got: {details:?}");
     }
 
     #[test]
