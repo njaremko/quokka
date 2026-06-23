@@ -539,7 +539,13 @@ impl DurationDb {
         self.new_flake_records.append(&mut other.new_flake_records);
     }
 
-    /// Persist accumulated state (no-op for an ephemeral store). Best-effort.
+    /// Persist accumulated state (no-op for an ephemeral store).
+    ///
+    /// Best-effort in that a write failure never aborts the test run — the DB
+    /// is a local duration/flake cache, not run state — but it is never silent:
+    /// every section is attempted, each failure is collected and returned, and
+    /// a section's unsaved records are retained (not cleared) so nothing is
+    /// dropped without a trace.
     pub fn flush(&mut self) -> std::io::Result<()> {
         if self.dir.as_os_str().is_empty() {
             return Ok(());
@@ -565,51 +571,65 @@ impl DurationDb {
             }
         }
 
+        // A failure in one section must neither skip the others nor silently
+        // drop that section's records; collect failures and surface them all.
+        let mut errors: Vec<String> = Vec::new();
+
         let perf_log_path = self.dir.join("perf.log");
         if !self.new_perf_samples.is_empty() {
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&perf_log_path) {
-                let mut buf = Vec::with_capacity(self.new_perf_samples.len() * 25);
-                for (env, key, ts, dur) in &self.new_perf_samples {
-                    buf.push(env.to_index() as u8);
-                    buf.extend_from_slice(&key.to_le_bytes());
-                    buf.extend_from_slice(&ts.to_le_bytes());
-                    buf.extend_from_slice(&dur.to_le_bytes());
-                }
-                let _ = file.write_all(&buf);
-                let _ = file.sync_data();
+            let mut buf = Vec::with_capacity(self.new_perf_samples.len() * 25);
+            for (env, key, ts, dur) in &self.new_perf_samples {
+                buf.push(env.to_index() as u8);
+                buf.extend_from_slice(&key.to_le_bytes());
+                buf.extend_from_slice(&ts.to_le_bytes());
+                buf.extend_from_slice(&dur.to_le_bytes());
             }
-            self.new_perf_samples.clear();
+            match append_records(&perf_log_path, &buf) {
+                Ok(()) => self.new_perf_samples.clear(),
+                Err(e) => errors.push(format!(
+                    "{} perf sample(s) -> {}: {e}",
+                    self.new_perf_samples.len(),
+                    perf_log_path.display()
+                )),
+            }
         }
 
         let flake_log_path = self.dir.join("flake.log");
         if !self.new_flake_records.is_empty() {
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&flake_log_path) {
-                let mut buf = Vec::with_capacity(self.new_flake_records.len() * 19);
-                for (env, key, failed, class, ts) in &self.new_flake_records {
-                    buf.push(env.to_index() as u8);
-                    buf.extend_from_slice(&key.to_le_bytes());
-                    buf.push(*failed as u8);
-                    buf.push(class.map(failure_class_to_u8).unwrap_or(0));
-                    buf.extend_from_slice(&ts.to_le_bytes());
-                }
-                let _ = file.write_all(&buf);
-                let _ = file.sync_data();
+            let mut buf = Vec::with_capacity(self.new_flake_records.len() * 19);
+            for (env, key, failed, class, ts) in &self.new_flake_records {
+                buf.push(env.to_index() as u8);
+                buf.extend_from_slice(&key.to_le_bytes());
+                buf.push(*failed as u8);
+                buf.push(class.map(failure_class_to_u8).unwrap_or(0));
+                buf.extend_from_slice(&ts.to_le_bytes());
             }
-            self.new_flake_records.clear();
+            match append_records(&flake_log_path, &buf) {
+                Ok(()) => self.new_flake_records.clear(),
+                Err(e) => errors.push(format!(
+                    "{} flake record(s) -> {}: {e}",
+                    self.new_flake_records.len(),
+                    flake_log_path.display()
+                )),
+            }
         }
 
         let names_log_path = self.dir.join("names.log");
         if !self.new_names.is_empty() {
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&names_log_path) {
-                let mut buf = Vec::new();
-                for (key, tid) in &self.new_names {
-                    buf.extend_from_slice(&key.to_le_bytes());
-                    let _ = write_test_identity(&mut buf, tid);
-                }
-                let _ = file.write_all(&buf);
-                let _ = file.sync_data();
+            let mut buf = Vec::new();
+            for (key, tid) in &self.new_names {
+                buf.extend_from_slice(&key.to_le_bytes());
+                // Encoding into an in-memory Vec cannot fail.
+                write_test_identity(&mut buf, tid).expect("name encode into Vec is infallible");
             }
-            self.new_names.clear();
+            match append_records(&names_log_path, &buf) {
+                Ok(()) => self.new_names.clear(),
+                Err(e) => errors.push(format!(
+                    "{} name(s) -> {}: {e}",
+                    self.new_names.len(),
+                    names_log_path.display()
+                )),
+            }
         }
 
         let perf_size = std::fs::metadata(&perf_log_path).map(|m| m.len()).unwrap_or(0);
@@ -640,10 +660,14 @@ impl DurationDb {
                     writer.flush()?;
                 }
                 std::fs::rename(&tmp, &path)?;
-                let _ = std::fs::File::create(&perf_log_path);
+                // Truncate the now-compacted log; a failure here would replay the
+                // already-compacted records on next load, so it must not be lost.
+                std::fs::File::create(&perf_log_path)?;
                 Ok(())
             };
-            let _ = write_perf();
+            if let Err(e) = write_perf() {
+                errors.push(format!("compact perf.bin: {e}"));
+            }
 
             let write_flake = || -> std::io::Result<()> {
                 let path = self.dir.join("flake.bin");
@@ -665,10 +689,12 @@ impl DurationDb {
                     writer.flush()?;
                 }
                 std::fs::rename(&tmp, &path)?;
-                let _ = std::fs::File::create(&flake_log_path);
+                std::fs::File::create(&flake_log_path)?;
                 Ok(())
             };
-            let _ = write_flake();
+            if let Err(e) = write_flake() {
+                errors.push(format!("compact flake.bin: {e}"));
+            }
 
             let write_names = || -> std::io::Result<()> {
                 let path = self.dir.join("names.bin");
@@ -685,18 +711,41 @@ impl DurationDb {
                     writer.flush()?;
                 }
                 std::fs::rename(&tmp, &path)?;
-                let _ = std::fs::File::create(&names_log_path);
+                std::fs::File::create(&names_log_path)?;
                 Ok(())
             };
-            let _ = write_names();
+            if let Err(e) = write_names() {
+                errors.push(format!("compact names.bin: {e}"));
+            }
         }
 
         if lock_acquired {
             let _ = std::fs::remove_file(&lock_path);
         }
 
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "duration DB flush incomplete ({} section(s) failed): {}",
+                errors.len(),
+                errors.join("; ")
+            )))
+        }
     }
+}
+
+/// Append a fully-encoded record batch to a log file and fsync it durably.
+/// Every failure (open, write, sync) is propagated so the caller can surface it
+/// rather than losing records silently.
+fn append_records(path: &std::path::Path, buf: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(buf)?;
+    file.sync_data()?;
+    Ok(())
 }
 
 /// Nearest-rank percentile (`p` in 0..=100) over unsorted samples.
@@ -800,6 +849,35 @@ mod tests {
         ));
         assert_eq!(db.flake(None, &tid).unwrap().failures, 1);
         assert_eq!(db.get_name(hash_key(&tid)), Some(&tid));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_surfaces_write_failure_and_keeps_unsaved_data() {
+        // A failed log write must never be swallowed: the error is surfaced to
+        // the caller and the unsaved records are retained, not silently dropped.
+        // We force the failure by planting a *directory* where perf.log must be
+        // a file, so opening it for append fails deterministically.
+        let dir = std::env::temp_dir().join(format!("brtr-db-silentfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join("perf.log")).unwrap();
+
+        let mut db = DurationDb::load(dir.clone());
+        let tid = id("m", "t");
+        db.record_at(Environment::Local, &tid, Duration::from_millis(5), false, None, 1);
+
+        let err = db
+            .flush()
+            .expect_err("flush must surface the perf.log write failure");
+        assert!(
+            err.to_string().contains("perf"),
+            "error must name the failing section: {err}"
+        );
+        assert!(
+            !db.new_perf_samples.is_empty(),
+            "unsaved perf samples must be retained on failure, not silently cleared"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

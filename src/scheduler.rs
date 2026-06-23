@@ -273,6 +273,8 @@ async fn reporter_task(
                                 &finished.result.name,
                                 &finished.result.details,
                             );
+                            // Best-effort: if the downward channel is broken, the
+                            // report_test_result below fails too and is logged.
                             let _ = orch.console(Level::WARN, line).await;
                         }
                     }
@@ -304,10 +306,15 @@ async fn reporter_task(
     } else {
         Level::INFO
     };
+    // The console line is best-effort live feedback; a broken downward channel
+    // also breaks the session report below, which is surfaced.
     let _ = orch.console(level, summary.clone()).await;
-    let _ = orch
+    if let Err(e) = orch
         .report_test_session(summary, context.trace_id.clone())
-        .await;
+        .await
+    {
+        eprintln!("quokka: failed to report the test session: {e:#}");
+    }
 
     if let Err(e) = db.flush() {
         eprintln!("quokka: failed to flush duration DB: {e:#}");
@@ -573,10 +580,16 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
     let kept = shard_filter(&plan.spec.display, &tests, config);
     if kept.is_empty() {
         // Nothing to run in this shard; still report discovery of zero tests.
-        let _ = ctx
+        if let Err(e) = ctx
             .orch
             .report_tests_discovered(plan.spec.handle_proto(), plan.spec.suite.clone(), vec![])
-            .await;
+            .await
+        {
+            eprintln!(
+                "quokka: failed to report discovery for {}: {e:#}",
+                plan.spec.display
+            );
+        }
         return;
     }
 
@@ -591,19 +604,28 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
             variant: config.variant.clone(),
         })
         .collect();
+    // A closed reporter channel means the reporter task died; that is detected
+    // by the run loop (which forces a failing verdict), so a dropped send here
+    // cannot leave a falsely green run.
     let _ = ctx
         .report_tx
         .send(ReporterMessage::Discovered(discovered_tids))
         .await;
 
-    let _ = ctx
+    if let Err(e) = ctx
         .orch
         .report_tests_discovered(
             plan.spec.handle_proto(),
             plan.spec.suite.clone(),
             discovered,
         )
-        .await;
+        .await
+    {
+        eprintln!(
+            "quokka: failed to report discovery for {}: {e:#}",
+            plan.spec.display
+        );
+    }
 
     if config.libtest_list_only {
         emit_list_only_stdout(&config.extra_test_args, &kept);
@@ -644,6 +666,9 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
                     per_target_sem,
                 )
                 .await;
+                // A closed reporter channel means the reporter task died, which
+                // the run loop detects and turns into a failing verdict; a
+                // dropped result here cannot leave a falsely green run.
                 let _ = ctx
                     .report_tx
                     .send(ReporterMessage::Finished(finished))
@@ -1484,14 +1509,20 @@ async fn report_target_failure(
     details: String,
 ) {
     let name = format!("{} (listing)", plan.spec.suite);
-    let _ = ctx
+    if let Err(e) = ctx
         .orch
         .report_tests_discovered(
             plan.spec.handle_proto(),
             plan.spec.suite.clone(),
             vec![name.clone()],
         )
-        .await;
+        .await
+    {
+        eprintln!(
+            "quokka: failed to report the failing-target listing for {}: {e:#}",
+            plan.spec.display
+        );
+    }
     let details = finalize_details(ctx, DetailKind::of(status), details).await;
     let test_id = TestIdentity {
         target: plan.spec.display.clone(),
@@ -1511,6 +1542,8 @@ async fn report_target_failure(
         details,
         None,
     );
+    // A closed reporter channel means the reporter task died, which the run loop
+    // detects and turns into a failing verdict; this drop cannot hide a failure.
     let _ = ctx
         .report_tx
         .send(ReporterMessage::Finished(vec![FinishedTest {
