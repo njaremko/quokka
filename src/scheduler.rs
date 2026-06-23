@@ -222,9 +222,17 @@ struct Tally {
     skipped: u64,
 }
 
-/// Max live `FAIL` console lines emitted before suppression, so a wholly broken
-/// run cannot flood buck2's console (the final summary still reports the total).
-const MAX_CONSOLE_FAILURES: u64 = 100;
+/// The live-console line for a failed test: its name plus the complete failure
+/// details (panic/assertion text, captured output, and the `[brtr: …]`
+/// annotation). Details are omitted only when empty, to avoid a dangling blank
+/// line; the full failure is otherwise always printed, never truncated.
+fn fail_console_line(name: &str, details: &str) -> String {
+    if details.is_empty() {
+        format!("FAIL {name}")
+    } else {
+        format!("FAIL {name}\n{details}")
+    }
+}
 
 async fn reporter_task(
     orch: Orchestrator,
@@ -244,34 +252,32 @@ async fn reporter_task(
             ReporterMessage::Finished(batch) => {
                 for finished in batch {
                     tally.total += 1;
-                    let failure = finished.status.is_failure();
                     match finished.status {
                         TestVerdict::Pass => tally.passed += 1,
                         TestVerdict::Skip | TestVerdict::Omitted => tally.skipped += 1,
                         _ => {}
                     }
-                    // Capture the name for a live console line before the result is moved.
-                    let fail_name = if failure && !finished.quarantined {
-                        Some(finished.result.name.clone())
-                    } else {
-                        None
-                    };
-                    if let Err(e) = orch.report_test_result(finished.result).await {
-                        eprintln!("quokka: failed to report a test result: {e:#}");
-                    }
-                    if failure {
+                    if finished.status.is_failure() {
                         if finished.quarantined {
                             tally.quarantined_failed += 1;
                         } else {
                             tally.failed += 1;
                             verdict = RunVerdict::Fail;
+                            // Live, complete failure feedback on buck2's console:
+                            // the name plus the full failure details. Borrow the
+                            // result before it is moved into the report below, so
+                            // no copy is made. Every non-quarantined failure is
+                            // shown; the loop is bounded by the finite number of
+                            // reported tests, so this cannot flood without bound.
+                            let line = fail_console_line(
+                                &finished.result.name,
+                                &finished.result.details,
+                            );
+                            let _ = orch.console(Level::WARN, line).await;
                         }
                     }
-                    // Live failure feedback on buck2's console (bounded to avoid flooding).
-                    if let Some(name) = fail_name
-                        && tally.failed <= MAX_CONSOLE_FAILURES
-                    {
-                        let _ = orch.console(Level::WARN, format!("FAIL {name}")).await;
+                    if let Err(e) = orch.report_test_result(finished.result).await {
+                        eprintln!("quokka: failed to report a test result: {e:#}");
                     }
                     // Record EACH fresh attempt as an independent flake/duration sample
                     // (a fail-then-pass flake records as runs+=2/failures+=1, not a clean
@@ -1314,7 +1320,7 @@ async fn make_finished(
         repeat: plan.repeat,
         repeat_index,
     };
-    let mut details = finalize_details(ctx, outcome.details).await;
+    let mut details = finalize_details(ctx, DetailKind::of(outcome.status), outcome.details).await;
     if outcome.status.is_failure() {
         let annotation = failure_annotation(plan, ctx, &test_id);
         if !annotation.is_empty() {
@@ -1375,15 +1381,46 @@ fn failure_annotation(plan: &TargetPlan, ctx: &TargetCtx, test_id: &TestIdentity
     format!("[brtr: {}]", parts.join(" | "))
 }
 
-/// Inline small logs; upload large ones to CAS and leave a short pointer.
-async fn finalize_details(ctx: &TargetCtx, details: String) -> String {
-    match result::route_log(details.len(), ctx.config.cas_inline_limit) {
-        result::LogRouting::Inline => details,
-        result::LogRouting::UploadToCas => upload_details_to_cas(ctx, details).await,
+/// Whether a details blob belongs to a failing test. A failure is never
+/// truncated inline: its complete output is printed even when it is also
+/// uploaded to CAS, so a developer sees the whole failure without fetching the
+/// artifact. Passing-test logs keep the bounded inline preview.
+#[derive(Clone, Copy)]
+enum DetailKind {
+    Failure,
+    Passing,
+}
+
+impl DetailKind {
+    fn of(status: TestVerdict) -> Self {
+        if status.is_failure() {
+            DetailKind::Failure
+        } else {
+            DetailKind::Passing
+        }
     }
 }
 
-async fn upload_details_to_cas(ctx: &TargetCtx, details: String) -> String {
+/// Inline small logs; upload large ones to CAS and leave a short pointer.
+/// Failing tests keep their full output inline regardless of size, so a failure
+/// is always printed in full (see [`DetailKind`]).
+async fn finalize_details(ctx: &TargetCtx, kind: DetailKind, details: String) -> String {
+    match result::route_log(details.len(), ctx.config.cas_inline_limit) {
+        result::LogRouting::Inline => details,
+        result::LogRouting::UploadToCas => upload_details_to_cas(ctx, kind, details).await,
+    }
+}
+
+/// The inline portion of a CAS-uploaded log: the complete text for a failure
+/// (so the full failure is always printed), a bounded head for a passing test.
+fn inline_body(kind: DetailKind, details: &str) -> String {
+    match kind {
+        DetailKind::Failure => details.to_owned(),
+        DetailKind::Passing => truncate(details),
+    }
+}
+
+async fn upload_details_to_cas(ctx: &TargetCtx, kind: DetailKind, details: String) -> String {
     let size = details.len();
     let path = std::env::temp_dir().join(format!(
         "brtr-log-{}-{}.txt",
@@ -1394,7 +1431,7 @@ async fn upload_details_to_cas(ctx: &TargetCtx, details: String) -> String {
     if let Err(e) = std::fs::write(&path, &details) {
         return format!(
             "[log {size} bytes; CAS upload skipped: {e}]\n{}",
-            truncate(&details)
+            inline_body(kind, &details)
         );
     }
     match ctx
@@ -1413,13 +1450,13 @@ async fn upload_details_to_cas(ctx: &TargetCtx, details: String) -> String {
                 digest.hash, digest.size_bytes
             );
             let _ = ctx.orch.attach_info_message(msg.clone()).await;
-            format!("{msg}\n{}", truncate(&details))
+            format!("{msg}\n{}", inline_body(kind, &details))
         }
         Err(e) => {
             let _ = std::fs::remove_file(&path);
             format!(
                 "[log {size} bytes; CAS upload failed: {e:#}]\n{}",
-                truncate(&details)
+                inline_body(kind, &details)
             )
         }
     }
@@ -1455,7 +1492,7 @@ async fn report_target_failure(
             vec![name.clone()],
         )
         .await;
-    let details = finalize_details(ctx, details).await;
+    let details = finalize_details(ctx, DetailKind::of(status), details).await;
     let test_id = TestIdentity {
         target: plan.spec.display.clone(),
         name: plan.spec.display.clone(), // Target failures use the target name as the base test name.
@@ -1536,5 +1573,39 @@ mod tests {
         };
         let summary = session_summary(&tally(), &context);
         assert!(!summary.contains("[host="), "got: {summary}");
+    }
+
+    #[test]
+    fn fail_console_line_carries_full_details() {
+        let line = fail_console_line("my::test", "panicked at 'boom'\nstack");
+        assert_eq!(line, "FAIL my::test\npanicked at 'boom'\nstack");
+    }
+
+    #[test]
+    fn fail_console_line_omits_empty_details() {
+        // No trailing newline when there is nothing to print after the name.
+        assert_eq!(fail_console_line("my::test", ""), "FAIL my::test");
+    }
+
+    #[test]
+    fn failure_details_are_kept_in_full_when_offloaded_to_cas() {
+        // A failure larger than the inline preview head must still be printed
+        // in full; only passing-test logs keep the bounded preview.
+        let big = "x".repeat(8192);
+        assert_eq!(inline_body(DetailKind::Failure, &big), big);
+
+        let preview = inline_body(DetailKind::Passing, &big);
+        assert!(preview.len() < big.len(), "passing log should be truncated");
+        assert!(
+            preview.ends_with("…[truncated, full log in CAS]"),
+            "got: {preview}"
+        );
+    }
+
+    #[test]
+    fn small_details_are_identical_for_both_kinds() {
+        let small = "assertion failed: left == right";
+        assert_eq!(inline_body(DetailKind::Failure, small), small);
+        assert_eq!(inline_body(DetailKind::Passing, small), small);
     }
 }
