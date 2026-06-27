@@ -38,7 +38,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::batching::{self, BatchFailurePolicy};
 use crate::caching::{self, CacheClass};
 use crate::cli::RunnerConfig;
-use crate::duration_db::{DurationDb, DurationEstimate};
+use crate::duration_db::{DurationDb, DurationEstimate, FlakeRecord};
 use crate::execution::{TestingRequest, build_listing_request, build_testing_request};
 use crate::executor_server::SpecEnvelope;
 
@@ -143,11 +143,11 @@ pub async fn run(
     let listing_sem = Arc::new(Semaphore::new(config.limits.max_inflight_listings));
 
     // Read-only duration snapshot for ordering/sharding/batching.
-    let estimates = Arc::new(load_db(config.duration_db.as_deref()));
+    let estimates = Arc::new(DurationStore::load(&config.duration_db));
 
     // Single reporter task: sole orchestrator result-writer + verdict owner.
     let (report_tx, report_rx) = mpsc::channel::<ReporterMessage>(config.limits.max_report_queue);
-    let reporter_db = load_db(config.duration_db.as_deref());
+    let reporter_db = DurationStore::load(&config.duration_db);
     let reporter = tokio::spawn(reporter_task(orch.clone(), report_rx, reporter_db, context));
 
     // Drive targets concurrently as their specs arrive.
@@ -205,10 +205,65 @@ async fn drain_joinset(tasks: &mut JoinSet<()>) -> bool {
     failed
 }
 
-fn load_db(dir: Option<&std::path::Path>) -> DurationDb {
-    match dir {
-        Some(dir) => DurationDb::load(dir.to_path_buf()),
-        None => DurationDb::ephemeral(),
+enum DurationStore {
+    Enabled(DurationDb),
+    Disabled,
+}
+
+impl DurationStore {
+    fn load(config: &crate::cli::DurationDbConfig) -> Self {
+        match config.persistent_path() {
+            Some(dir) => Self::Enabled(DurationDb::load(dir.to_path_buf())),
+            None => Self::Disabled,
+        }
+    }
+
+    fn estimate(
+        &self,
+        env: Option<crate::duration_db::Environment>,
+        test_id: &TestIdentity,
+    ) -> DurationEstimate {
+        match self {
+            Self::Enabled(db) => db.estimate(env, test_id),
+            Self::Disabled => DurationEstimate::Unseen,
+        }
+    }
+
+    fn flake(
+        &self,
+        env: Option<crate::duration_db::Environment>,
+        test_id: &TestIdentity,
+    ) -> Option<FlakeRecord> {
+        match self {
+            Self::Enabled(db) => db.flake(env, test_id),
+            Self::Disabled => None,
+        }
+    }
+
+    fn record_discovered_name(&mut self, test_id: &TestIdentity) {
+        if let Self::Enabled(db) = self {
+            db.record_discovered_name(test_id);
+        }
+    }
+
+    fn record(
+        &mut self,
+        env: crate::duration_db::Environment,
+        test_id: &TestIdentity,
+        duration: Duration,
+        failed: bool,
+        failure_class: Option<FailureClass>,
+    ) {
+        if let Self::Enabled(db) = self {
+            db.record(env, test_id, duration, failed, failure_class);
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Enabled(db) => db.flush(),
+            Self::Disabled => Ok(()),
+        }
     }
 }
 
@@ -237,7 +292,7 @@ fn fail_console_line(name: &str, details: &str) -> String {
 async fn reporter_task(
     orch: Orchestrator,
     mut rx: mpsc::Receiver<ReporterMessage>,
-    mut db: DurationDb,
+    mut db: DurationStore,
     context: crate::cli::SessionContext,
 ) -> RunVerdict {
     let mut verdict = RunVerdict::Pass;
@@ -269,10 +324,8 @@ async fn reporter_task(
                             // no copy is made. Every non-quarantined failure is
                             // shown; the loop is bounded by the finite number of
                             // reported tests, so this cannot flood without bound.
-                            let line = fail_console_line(
-                                &finished.result.name,
-                                &finished.result.details,
-                            );
+                            let line =
+                                fail_console_line(&finished.result.name, &finished.result.details);
                             // Best-effort: if the downward channel is broken, the
                             // report_test_result below fails too and is logged.
                             let _ = orch.console(Level::WARN, line).await;
@@ -349,7 +402,7 @@ struct TargetCtx {
     config: Arc<RunnerConfig>,
     global_sem: Arc<Semaphore>,
     listing_sem: Arc<Semaphore>,
-    estimates: Arc<DurationDb>,
+    estimates: Arc<DurationStore>,
     report_tx: mpsc::Sender<ReporterMessage>,
 }
 
@@ -364,9 +417,25 @@ struct TargetPlan {
     timeout: Duration,
     profile: SchedulingProfile,
     owner: Owner,
+    batch_mode: TargetBatchMode,
     /// Effective repetition for this target: the global `--stress` if set,
     /// otherwise stress implied by a `rust:stress` label, otherwise `Once`.
     repeat: RepeatKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetBatchMode {
+    Global,
+    Override(batching::BatchMode),
+}
+
+impl TargetBatchMode {
+    fn resolve(self, global: batching::BatchMode) -> batching::BatchMode {
+        match self {
+            Self::Global => global,
+            Self::Override(mode) => mode,
+        }
+    }
 }
 
 impl TargetPlan {
@@ -382,10 +451,7 @@ impl TargetPlan {
         // label opts this target into the configured per-label repetition count.
         let repeat = if config.stress.is_stress() {
             config.stress
-        } else if labels
-            .iter()
-            .any(|l| l.split_once(':').unwrap_or(("", l)).1 == "stress")
-        {
+        } else if has_label(labels, "stress") {
             RepeatKind::Stress(config.stress_label_reps)
         } else {
             RepeatKind::Once
@@ -405,6 +471,7 @@ impl TargetPlan {
                 SchedulingProfile::default()
             }),
             owner: policy::owner(labels),
+            batch_mode: target_batch_mode(labels),
             repeat,
             spec,
         }
@@ -437,6 +504,20 @@ impl TargetPlan {
 
     fn quarantined(&self) -> bool {
         self.quarantine == QuarantineStatus::Quarantined
+    }
+}
+
+fn has_label(labels: &[String], name: &str) -> bool {
+    labels
+        .iter()
+        .any(|label| label.split_once(':').unwrap_or(("", label)).1 == name)
+}
+
+fn target_batch_mode(labels: &[String]) -> TargetBatchMode {
+    if has_label(labels, "big") {
+        TargetBatchMode::Override(batching::BatchMode::PerTest)
+    } else {
+        TargetBatchMode::Global
     }
 }
 
@@ -639,6 +720,7 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
         config,
         &ctx.estimates,
         plan.translator.parser_capability(),
+        plan.batch_mode,
     );
 
     // ---- Fan out actions (bounded, per-target permit) ----
@@ -744,8 +826,9 @@ fn build_batches(
     target: &str,
     tests: &[crate::listing::TestCase],
     config: &RunnerConfig,
-    db: &DurationDb,
+    db: &DurationStore,
     capability: crate::translator::DemuxCapability,
+    target_batch_mode: TargetBatchMode,
 ) -> Vec<batching::TestSelection<String>> {
     #[derive(Clone)]
     struct LocalBatchInput {
@@ -778,7 +861,9 @@ fn build_batches(
         .collect();
 
     let batch_mode = match capability {
-        crate::translator::DemuxCapability::NameAttributable => config.batch_mode,
+        crate::translator::DemuxCapability::NameAttributable => {
+            target_batch_mode.resolve(config.batch_mode)
+        }
         crate::translator::DemuxCapability::SingletonOnly => batching::BatchMode::PerTest,
     };
 
@@ -1011,18 +1096,20 @@ async fn run_group(
     loop {
         let attempt_index = failure_attempt + infra_attempt;
         let mut has_unseen = false;
-        for name in names {
-            let test_id = TestIdentity {
-                target: plan.spec.display.to_owned(),
-                name: name.to_owned(),
-                variant: config.variant.clone(),
-            };
-            if matches!(
-                ctx.estimates.estimate(None, &test_id),
-                crate::duration_db::DurationEstimate::Unseen
-            ) {
-                has_unseen = true;
-                break;
+        if config.duration_db.cache_busts_unseen_tests() {
+            for name in names {
+                let test_id = TestIdentity {
+                    target: plan.spec.display.to_owned(),
+                    name: name.to_owned(),
+                    variant: config.variant.clone(),
+                };
+                if matches!(
+                    ctx.estimates.estimate(None, &test_id),
+                    crate::duration_db::DurationEstimate::Unseen
+                ) {
+                    has_unseen = true;
+                    break;
+                }
             }
         }
         let mut caching = crate::caching::TestExecutionCaching::resolve(
@@ -1086,7 +1173,11 @@ async fn run_group(
             suite: plan.spec.suite.clone(),
             testcases,
             cmd: crate::execution::build_cmd(&plan.spec, &exec_args),
-            env: crate::execution::build_test_env(&plan.spec, &config.extra_env, &config.declared_output_env),
+            env: crate::execution::build_test_env(
+                &plan.spec,
+                &config.extra_env,
+                &config.declared_output_env,
+            ),
             variant: config.variant.identity(),
             repeat_count,
             profile: plan.testing_profile(config),
@@ -1665,7 +1756,11 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batching::{BatchMode, TestSelection};
     use crate::cli::SessionContext;
+    use crate::listing::TestCaseKind;
+    use crate::translator::DemuxCapability;
+    use std::num::NonZeroUsize;
 
     fn tally() -> Tally {
         Tally {
@@ -1699,6 +1794,90 @@ mod tests {
         assert!(!summary.contains("[host="), "got: {summary}");
     }
 
+    #[test]
+    fn big_label_selects_per_test_batching() {
+        assert_eq!(
+            target_batch_mode(&["rust:big".to_owned()]),
+            TargetBatchMode::Override(BatchMode::PerTest)
+        );
+        assert_eq!(
+            target_batch_mode(&["rust:gpu".to_owned()]),
+            TargetBatchMode::Global
+        );
+    }
+
+    #[test]
+    fn big_batch_override_keeps_each_test_singleton() {
+        let mut config = crate::cli::parse(
+            [
+                "runner",
+                "--executor-fd",
+                "1",
+                "--orchestrator-fd",
+                "2",
+                "--",
+                "ignored",
+                "--batch-mode",
+                "fixed-chunk",
+                "--chunk-size",
+                "2",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        )
+        .expect("config")
+        .config;
+        config.batch_mode = BatchMode::FixedChunk {
+            size: NonZeroUsize::new(2).unwrap(),
+        };
+        let tests = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| TestCase::new(name.to_owned(), TestCaseKind::Test, false))
+            .collect::<Vec<_>>();
+
+        let actual = build_batches(
+            "target",
+            &tests,
+            &config,
+            &DurationStore::Disabled,
+            DemuxCapability::NameAttributable,
+            TargetBatchMode::Override(BatchMode::PerTest),
+        );
+
+        assert_eq!(
+            actual,
+            vec![
+                TestSelection::Explicit(vec!["a".to_owned()]),
+                TestSelection::Explicit(vec!["b".to_owned()]),
+                TestSelection::Explicit(vec!["c".to_owned()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn disabled_duration_store_never_observes_recorded_history() {
+        let test_id = TestIdentity {
+            target: "target".to_owned(),
+            name: "test".to_owned(),
+            variant: crate::variant::Variant::Default,
+        };
+        let mut store = DurationStore::Disabled;
+
+        store.record_discovered_name(&test_id);
+        store.record(
+            crate::duration_db::Environment::Local,
+            &test_id,
+            Duration::from_millis(7),
+            true,
+            None,
+        );
+
+        assert_eq!(store.estimate(None, &test_id), DurationEstimate::Unseen);
+        assert!(store.flake(None, &test_id).is_none());
+        store.flush().expect("disabled store flush is a no-op");
+    }
+
     fn verdict(
         raw: ProcessOutcome,
         whole_unit: bool,
@@ -1725,7 +1904,10 @@ mod tests {
             details.contains("getCellValueText {row=0,col=0} expected"),
             "failure detail must carry the action stderr; got: {details:?}"
         );
-        assert!(details.contains("---- action stderr ----"), "got: {details:?}");
+        assert!(
+            details.contains("---- action stderr ----"),
+            "got: {details:?}"
+        );
     }
 
     #[test]
@@ -1746,8 +1928,14 @@ mod tests {
         // clean exit — there is no evidence the test passed.
         // verdict(raw, whole_unit, produced_stdout, singleton)
         let fresh_garbage = ProcessOutcome::Finished { exit_code: 0 };
-        assert_eq!(verdict(fresh_garbage, false, true, true), TestVerdict::Fatal);
-        assert_eq!(verdict(fresh_garbage, false, true, false), TestVerdict::Fatal);
+        assert_eq!(
+            verdict(fresh_garbage, false, true, true),
+            TestVerdict::Fatal
+        );
+        assert_eq!(
+            verdict(fresh_garbage, false, true, false),
+            TestVerdict::Fatal
+        );
         // The law, restated: never Pass in this region, for any exit code.
         for exit_code in [0, 1, 101, -1] {
             assert_ne!(
@@ -1762,7 +1950,12 @@ mod tests {
         // A cache replay drops stdout (produced_stdout == false); the cached exit
         // status is authoritative, so an absent name on exit 0 passed.
         assert_eq!(
-            verdict(ProcessOutcome::Finished { exit_code: 0 }, false, false, true),
+            verdict(
+                ProcessOutcome::Finished { exit_code: 0 },
+                false,
+                false,
+                true
+            ),
             TestVerdict::Pass
         );
     }

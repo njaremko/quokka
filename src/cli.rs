@@ -12,7 +12,7 @@
 //! We split argv on the first `--`: the left is the outer flags, the right is
 //! the tpx args (a separate clap parse).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use std::num::NonZeroU32;
@@ -139,6 +139,11 @@ struct TpxConfig {
     /// invokes the runner with only an executable path.
     #[arg(long)]
     duration_db: Option<PathBuf>,
+
+    /// Disable the advisory duration/flake metadata store. This also disables
+    /// duration-DB-driven cache busting for unseen tests.
+    #[arg(long)]
+    no_duration_db: bool,
 
     /// Captured logs larger than this many bytes are uploaded to CAS.
     #[arg(long, default_value_t = 65_536)]
@@ -324,7 +329,40 @@ impl Default for SchedulerLimits {
     }
 }
 
-/// Fully resolved, typed runner configuration.
+/// Duration database state after CLI parsing and binary-level defaulting.
+///
+/// `Auto` is the pre-main state for an omitted `--duration-db`: the binary may
+/// resolve it to a persistent path, while tests and direct library callers can
+/// leave it unresolved and run without duration metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurationDbConfig {
+    Auto,
+    Persistent(PathBuf),
+    Disabled,
+}
+
+impl DurationDbConfig {
+    pub fn resolve_auto(&mut self, path: Option<PathBuf>) {
+        if matches!(self, Self::Auto) {
+            if let Some(path) = path {
+                *self = Self::Persistent(path);
+            }
+        }
+    }
+
+    pub fn persistent_path(&self) -> Option<&Path> {
+        match self {
+            Self::Persistent(path) => Some(path.as_path()),
+            Self::Auto | Self::Disabled => None,
+        }
+    }
+
+    pub fn cache_busts_unseen_tests(&self) -> bool {
+        matches!(self, Self::Persistent(_))
+    }
+}
+
+/// Typed runner configuration after CLI parsing.
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
     pub per_test_timeout: Duration,
@@ -343,7 +381,7 @@ pub struct RunnerConfig {
     pub flaky_attempts: u32,
     pub limits: SchedulerLimits,
     pub cas_inline_limit: usize,
-    pub duration_db: Option<PathBuf>,
+    pub duration_db: DurationDbConfig,
     pub libtest_help_only: bool,
     pub libtest_usage_error: Option<String>,
     pub libtest_list_only: bool,
@@ -389,6 +427,8 @@ pub enum CliError {
     InvalidDeclaredOutputEnv(String),
     #[error("--shard-index {index} is out of range for --shard-count {count}")]
     ShardOutOfRange { index: u16, count: u16 },
+    #[error("--duration-db and --no-duration-db cannot be used together")]
+    ConflictingDurationDbFlags,
     #[error(transparent)]
     Parse(#[from] clap::Error),
 }
@@ -525,6 +565,17 @@ fn resolve_config(
         None => RepeatKind::Once,
     };
     let stress_label_reps = NonZeroU32::new(tpx.stress_label_reps).unwrap_or(NonZeroU32::MIN);
+    let duration_db = if tpx.no_duration_db {
+        if tpx.duration_db.is_some() {
+            return Err(CliError::ConflictingDurationDbFlags);
+        }
+        DurationDbConfig::Disabled
+    } else {
+        match tpx.duration_db {
+            Some(path) => DurationDbConfig::Persistent(path),
+            None => DurationDbConfig::Auto,
+        }
+    };
 
     let shard = ShardSpec {
         index: tpx.shard_index,
@@ -580,7 +631,7 @@ fn resolve_config(
             ..SchedulerLimits::default()
         },
         cas_inline_limit: tpx.cas_inline_limit,
-        duration_db: tpx.duration_db,
+        duration_db,
         libtest_help_only: libtest_user_requests_help(&extra_test_args),
         libtest_usage_error: libtest_user_usage_error(&extra_test_args),
         libtest_list_only: libtest_user_requests_listing_only(&extra_test_args),
@@ -653,6 +704,7 @@ mod tests {
         // Scheduler concurrency limits fall back to their defaults.
         assert_eq!(inv.config.limits.max_inflight_test_actions, 2_000);
         assert_eq!(inv.config.limits.max_inflight_per_target, 128);
+        assert_eq!(inv.config.duration_db, DurationDbConfig::Auto);
     }
 
     #[test]
@@ -675,6 +727,54 @@ mod tests {
         // Zero would deadlock the scheduler (a semaphore with no permits), so it
         // is clamped up to one.
         assert_eq!(inv.config.limits.max_inflight_per_target, 1);
+    }
+
+    #[test]
+    fn parses_no_duration_db_flag() {
+        let inv = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--no-duration-db",
+        ]))
+        .expect("must parse duration DB disable flag");
+        assert_eq!(inv.config.duration_db, DurationDbConfig::Disabled);
+    }
+
+    #[test]
+    fn rejects_conflicting_duration_db_flags() {
+        let err = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--duration-db",
+            "/tmp/quokka-db",
+            "--no-duration-db",
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, CliError::ConflictingDurationDbFlags));
+    }
+
+    #[test]
+    fn duration_db_auto_resolution_preserves_disabled_state() {
+        let mut auto = DurationDbConfig::Auto;
+        auto.resolve_auto(Some(PathBuf::from("/tmp/quokka-db")));
+        assert_eq!(
+            auto,
+            DurationDbConfig::Persistent(PathBuf::from("/tmp/quokka-db"))
+        );
+
+        let mut disabled = DurationDbConfig::Disabled;
+        disabled.resolve_auto(Some(PathBuf::from("/tmp/quokka-db")));
+        assert_eq!(disabled, DurationDbConfig::Disabled);
     }
 
     #[test]

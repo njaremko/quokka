@@ -727,6 +727,45 @@ async fn target_batching_still_reports_each_test() {
 }
 
 #[tokio::test]
+async fn big_label_overrides_target_batching_to_singleton_actions() {
+    let events = vec![
+        ("a".to_string(), "ok"),
+        ("b".to_string(), "ok"),
+        ("c".to_string(), "ok"),
+    ];
+    let (orch, recorded, _server) = mock_orchestrator(events).await;
+    let mut config = test_config();
+    config.batch_mode = quokka::batching::BatchMode::Target;
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    intake_tx
+        .send(SpecEnvelope::Spec(Box::new(libtest_spec_labeled(
+            17,
+            vec!["rust:big".to_string()],
+        ))))
+        .unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, config, test_context()).await;
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert_eq!(rec.testing_calls.len(), 3, "calls={:?}", rec.testing_calls);
+    assert!(
+        rec.testing_calls.iter().all(|call| call.len() == 1),
+        "rust:big must force singleton testing actions, got {:?}",
+        rec.testing_calls
+    );
+    let mut tested = rec
+        .testing_calls
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    tested.sort();
+    assert_eq!(tested, vec!["a", "b", "c"]);
+    assert_eq!(rec.end_exit_code, Some(0));
+}
+
+#[tokio::test]
 async fn batch_isolation_reruns_missing_member_singly() {
     // A batched action omits `y`'s result (mid-batch crash). With the default
     // RerunPerTestToIsolate policy, `y` is re-run alone (where it is reported ok),
@@ -832,7 +871,7 @@ async fn flake_db_records_each_fresh_attempt_not_just_the_folded_best() {
     let (orch, _recorded, _server) =
         mock_orchestrator_full(events, None, Some("flaky".to_string()), false, false).await;
     let mut config = test_config();
-    config.duration_db = Some(dir.clone());
+    config.duration_db = cli::DurationDbConfig::Persistent(dir.clone());
 
     let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
     intake_tx
@@ -906,6 +945,24 @@ async fn cached_replay_with_empty_output_reports_pass_from_exit_code() {
 }
 
 #[tokio::test]
+async fn disabled_duration_db_does_not_cache_bust_unseen_tests() {
+    let events = vec![("a".to_string(), "ok")];
+    let (orch, recorded, _server) = mock_orchestrator(events).await;
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    intake_tx
+        .send(SpecEnvelope::Spec(Box::new(libtest_spec(1))))
+        .unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    let mut config = test_config();
+    config.duration_db = cli::DurationDbConfig::Disabled;
+
+    drive_to_completion(orch, intake_rx, config, test_context()).await;
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert_eq!(rec.disable_caching_calls, vec![false]);
+}
+
+#[tokio::test]
 async fn unseen_then_seen_test_caching() {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -926,7 +983,7 @@ async fn unseen_then_seen_test_caching() {
         intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
 
         let mut config = test_config();
-        config.duration_db = Some(temp_dir.clone());
+        config.duration_db = cli::DurationDbConfig::Persistent(temp_dir.clone());
 
         drive_to_completion(orch, intake_rx, config, test_context()).await;
         let rec = recorded.lock().expect("recorded mutex poisoned");
@@ -947,7 +1004,7 @@ async fn unseen_then_seen_test_caching() {
         intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
 
         let mut config = test_config();
-        config.duration_db = Some(temp_dir.clone());
+        config.duration_db = cli::DurationDbConfig::Persistent(temp_dir.clone());
 
         drive_to_completion(orch, intake_rx, config, test_context()).await;
         let rec = recorded.lock().expect("recorded mutex poisoned");
@@ -992,7 +1049,7 @@ attempts = 3
         intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
 
         let mut config = test_config();
-        config.duration_db = Some(temp_db.clone());
+        config.duration_db = cli::DurationDbConfig::Persistent(temp_db.clone());
         config.quokka_config = quokka::config::load_config_from_home(Some(temp_home.clone()));
 
         drive_to_completion(orch, intake_rx, config, test_context()).await;
@@ -1012,7 +1069,7 @@ attempts = 3
         intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
 
         let mut config = test_config();
-        config.duration_db = Some(temp_db.clone());
+        config.duration_db = cli::DurationDbConfig::Persistent(temp_db.clone());
         config.quokka_config = quokka::config::load_config_from_home(Some(temp_home.clone()));
 
         drive_to_completion(orch, intake_rx, config, test_context()).await;

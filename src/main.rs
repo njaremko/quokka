@@ -11,15 +11,15 @@ use quokka::cli;
 use quokka::run::run;
 
 /// Default location for the advisory duration/flake metadata store when
-/// `--duration-db` is not supplied: a directory next to the runner binary.
+/// `--duration-db` is not supplied: `$HOME/.quokka` when possible, otherwise a
+/// directory next to the runner binary.
 ///
 /// buck2 invokes this runner as its `v2_test_executor` with only an executable
 /// path — it cannot pass `--duration-db` — so this default is how the DB is
-/// maintained in the production `buck2 test` path. Placing it beside the binary
-/// (e.g. `.tmp/quokka-db` next to `.tmp/quokka`) keeps
-/// it stable across runs, out of `buck-out`, and within the same git-ignored
-/// `.tmp` tree. Returns `None` only if the executable path is unavailable, in
-/// which case the DB stays ephemeral.
+/// maintained in the production `buck2 test` path. The home-scoped path shares
+/// history across runner binary upgrades; the binary-adjacent fallback keeps
+/// history stable when `HOME` is unavailable. Returns `None` only if neither
+/// path can be resolved, in which case duration metadata stays disabled.
 fn default_duration_db() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         Some(home.join(".quokka"))
@@ -33,7 +33,10 @@ fn default_duration_db() -> Option<PathBuf> {
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "quokka", about = "Quokka: A better external test runner for Buck2")]
+#[command(
+    name = "quokka",
+    about = "Quokka: A better external test runner for Buck2"
+)]
 struct QuokkaCli {
     #[command(subcommand)]
     subcommand: Subcommands,
@@ -78,9 +81,10 @@ fn main() -> ExitCode {
         }
     };
 
-    if invocation.config.duration_db.is_none() {
-        invocation.config.duration_db = default_duration_db();
-    }
+    invocation
+        .config
+        .duration_db
+        .resolve_auto(default_duration_db());
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -93,7 +97,11 @@ fn main() -> ExitCode {
         }
     };
 
-    match runtime.block_on(run(invocation.transport, invocation.config, invocation.context)) {
+    match runtime.block_on(run(
+        invocation.transport,
+        invocation.config,
+        invocation.context,
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("quokka: fatal: {e:#}");
