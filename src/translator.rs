@@ -820,10 +820,27 @@ fn decode_json(stdout: &str) -> FxHashMap<String, PerTestObservation> {
             "started" => continue,
             _ => TestVerdict::Fatal,
         };
-        let details = event.stdout.or(event.message).unwrap_or_default();
+        let details = json_failure_details(event.stdout, event.message);
         out.insert(name, PerTestObservation { status, details });
     }
     out
+}
+
+fn json_failure_details(stdout: Option<String>, message: Option<String>) -> String {
+    match (stdout, message) {
+        (Some(stdout), Some(message)) => {
+            if stdout.is_empty() {
+                message
+            } else if message.is_empty() || stdout == message {
+                stdout
+            } else {
+                format!("{stdout}\n{message}")
+            }
+        }
+        (Some(stdout), None) => stdout,
+        (None, Some(message)) => message,
+        (None, None) => String::new(),
+    }
 }
 
 /// Parse stable libtest text run output: `test <name> ... <status>` lines, with
@@ -1204,6 +1221,15 @@ mod tests {
                 details: String::new()
             })
         );
+    }
+
+    #[test]
+    fn json_failed_event_preserves_stdout_and_message() {
+        let output = r#"{ "type": "test", "event": "failed", "name": "alpha", "stdout": "captured stdout", "message": "panic message" }"#;
+        let observations = libtest_decode(RunFormat::Json, output.as_bytes(), b"");
+        let details = &observations.get("alpha").expect("alpha result").details;
+        assert!(details.contains("captured stdout"), "got: {details:?}");
+        assert!(details.contains("panic message"), "got: {details:?}");
     }
 
     #[test]

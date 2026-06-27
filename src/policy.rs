@@ -24,8 +24,6 @@ impl TestTimeout {
     }
 }
 
-
-
 /// Whether a target's failures should block the build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuarantineStatus {
@@ -100,7 +98,10 @@ pub fn test_timeout(labels: &[String]) -> TestTimeout {
 
 /// Derive quarantine status from labels.
 pub fn quarantine_status(labels: &[String]) -> QuarantineStatus {
-    if labels.iter().any(|l| l.split_once(':').unwrap_or(("", l)).1 == "quarantined") {
+    if labels
+        .iter()
+        .any(|l| l.split_once(':').unwrap_or(("", l)).1 == "quarantined")
+    {
         QuarantineStatus::Quarantined
     } else {
         QuarantineStatus::Active
@@ -126,7 +127,9 @@ pub fn owner(labels: &[String]) -> Owner {
         .iter()
         .filter_map(|l| {
             let suffix = l.split_once(':').unwrap_or(("", l)).1;
-            suffix.strip_prefix("owner=").map(|t| Owner::Team(t.to_owned()))
+            suffix
+                .strip_prefix("owner=")
+                .map(|t| Owner::Team(t.to_owned()))
         })
         .last()
         .unwrap_or(Owner::Unowned)
@@ -147,7 +150,10 @@ mod tests {
             Duration::from_secs(600)
         );
         assert_eq!(
-            test_timeout(&["python:timeout=10s".to_owned(), "rust:timeout=20s".to_owned()]),
+            test_timeout(&[
+                "python:timeout=10s".to_owned(),
+                "rust:timeout=20s".to_owned()
+            ]),
             TestTimeout::Fixed(Duration::from_secs(20))
         );
     }
@@ -155,7 +161,10 @@ mod tests {
     #[test]
     fn retry_policy_from_labels() {
         assert!(retry_policy(&["rust:flaky".to_owned()], 3).allows_retry());
-        assert_eq!(retry_policy(&["python:flaky".to_owned()], 3).max_attempts(), 3);
+        assert_eq!(
+            retry_policy(&["python:flaky".to_owned()], 3).max_attempts(),
+            3
+        );
         assert!(!retry_policy(&[], 3).allows_retry());
         assert_eq!(retry_policy(&[], 3).max_attempts(), 1);
     }

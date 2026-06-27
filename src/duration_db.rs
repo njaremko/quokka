@@ -156,13 +156,20 @@ fn read_test_identity<R: Read>(reader: &mut R) -> Option<TestIdentity> {
     let name = read_string(reader)?;
     let variant_str = read_string(reader)?;
     let variant = crate::variant::Variant::parse(&variant_str);
-    Some(TestIdentity { target, name, variant })
+    Some(TestIdentity {
+        target,
+        name,
+        variant,
+    })
 }
 
 fn write_test_identity<W: Write>(writer: &mut W, tid: &TestIdentity) -> std::io::Result<()> {
     write_string(writer, &tid.target)?;
     write_string(writer, &tid.name)?;
-    let variant_str = tid.variant.identity().unwrap_or_else(|| "default".to_owned());
+    let variant_str = tid
+        .variant
+        .identity()
+        .unwrap_or_else(|| "default".to_owned());
     write_string(writer, &variant_str)?;
     Ok(())
 }
@@ -205,14 +212,18 @@ impl DurationDb {
                         for _ in 0..len {
                             let mut k_buf = [0u8; 8];
                             let mut samples_len = [0u8; 1];
-                            if reader.read_exact(&mut k_buf).is_ok() && reader.read_exact(&mut samples_len).is_ok() {
+                            if reader.read_exact(&mut k_buf).is_ok()
+                                && reader.read_exact(&mut samples_len).is_ok()
+                            {
                                 let k = u64::from_le_bytes(k_buf);
                                 let s_len = samples_len[0];
                                 let mut samples = Vec::with_capacity(s_len as usize);
                                 for _ in 0..s_len {
                                     let mut ts_buf = [0u8; 8];
                                     let mut dur_buf = [0u8; 8];
-                                    if reader.read_exact(&mut ts_buf).is_ok() && reader.read_exact(&mut dur_buf).is_ok() {
+                                    if reader.read_exact(&mut ts_buf).is_ok()
+                                        && reader.read_exact(&mut dur_buf).is_ok()
+                                    {
                                         samples.push(DurationSample {
                                             timestamp_ms: u64::from_le_bytes(ts_buf),
                                             duration_ms: u64::from_le_bytes(dur_buf),
@@ -233,9 +244,9 @@ impl DurationDb {
                 let mut i = 0;
                 while i + 25 <= buf.len() {
                     let env_idx = buf[i] as usize;
-                    let k = u64::from_le_bytes(buf[i+1..i+9].try_into().unwrap());
-                    let ts = u64::from_le_bytes(buf[i+9..i+17].try_into().unwrap());
-                    let dur = u64::from_le_bytes(buf[i+17..i+25].try_into().unwrap());
+                    let k = u64::from_le_bytes(buf[i + 1..i + 9].try_into().unwrap());
+                    let ts = u64::from_le_bytes(buf[i + 9..i + 17].try_into().unwrap());
+                    let dur = u64::from_le_bytes(buf[i + 17..i + 25].try_into().unwrap());
                     if env_idx < 2 {
                         perf[env_idx].entry(k).or_default().record(ts, dur);
                     }
@@ -259,19 +270,27 @@ impl DurationDb {
                             let mut fail_buf = [0u8; 8];
                             let mut ts_buf = [0u8; 8];
                             let mut class_buf = [0u8; 1];
-                            if reader.read_exact(&mut k_buf).is_ok() &&
-                               reader.read_exact(&mut runs_buf).is_ok() &&
-                               reader.read_exact(&mut fail_buf).is_ok() &&
-                               reader.read_exact(&mut ts_buf).is_ok() &&
-                               reader.read_exact(&mut class_buf).is_ok() {
+                            if reader.read_exact(&mut k_buf).is_ok()
+                                && reader.read_exact(&mut runs_buf).is_ok()
+                                && reader.read_exact(&mut fail_buf).is_ok()
+                                && reader.read_exact(&mut ts_buf).is_ok()
+                                && reader.read_exact(&mut class_buf).is_ok()
+                            {
                                 let k = u64::from_le_bytes(k_buf);
                                 let ts = u64::from_le_bytes(ts_buf);
-                                flake[i].insert(k, FlakeRecord {
-                                    runs: u64::from_le_bytes(runs_buf),
-                                    failures: u64::from_le_bytes(fail_buf),
-                                    last_failure_timestamp_ms: if ts == u64::MAX { None } else { Some(ts) },
-                                    last_failure_class: failure_class_from_u8(class_buf[0]),
-                                });
+                                flake[i].insert(
+                                    k,
+                                    FlakeRecord {
+                                        runs: u64::from_le_bytes(runs_buf),
+                                        failures: u64::from_le_bytes(fail_buf),
+                                        last_failure_timestamp_ms: if ts == u64::MAX {
+                                            None
+                                        } else {
+                                            Some(ts)
+                                        },
+                                        last_failure_class: failure_class_from_u8(class_buf[0]),
+                                    },
+                                );
                             }
                         }
                     }
@@ -285,12 +304,15 @@ impl DurationDb {
                 let mut i = 0;
                 while i + 19 <= buf.len() {
                     let env_idx = buf[i] as usize;
-                    let k = u64::from_le_bytes(buf[i+1..i+9].try_into().unwrap());
-                    let failed = buf[i+9] != 0;
-                    let class = failure_class_from_u8(buf[i+10]);
-                    let ts = u64::from_le_bytes(buf[i+11..i+19].try_into().unwrap());
+                    let k = u64::from_le_bytes(buf[i + 1..i + 9].try_into().unwrap());
+                    let failed = buf[i + 9] != 0;
+                    let class = failure_class_from_u8(buf[i + 10]);
+                    let ts = u64::from_le_bytes(buf[i + 11..i + 19].try_into().unwrap());
                     if env_idx < 2 {
-                        flake[env_idx].entry(k).or_default().record(failed, class, ts);
+                        flake[env_idx]
+                            .entry(k)
+                            .or_default()
+                            .record(failed, class, ts);
                     }
                     i += 19;
                 }
@@ -406,11 +428,7 @@ impl DurationDb {
                 }
             }
         }
-        if found {
-            Some(combined)
-        } else {
-            None
-        }
+        if found { Some(combined) } else { None }
     }
 
     /// The duration estimate for a test. If environment is known, queries it,
@@ -440,7 +458,10 @@ impl DurationDb {
             let ms_samples: Vec<u64> = combined.samples.iter().map(|s| s.duration_ms).collect();
             let p50 = percentile(&ms_samples, 50);
             let p95 = percentile(&ms_samples, 95);
-            DurationEstimate::Measured { p50_ms: p50, p95_ms: p95 }
+            DurationEstimate::Measured {
+                p50_ms: p50,
+                p95_ms: p95,
+            }
         }
     }
 
@@ -464,11 +485,7 @@ impl DurationDb {
             }
         }
 
-        if found {
-            Some(combined)
-        } else {
-            None
-        }
+        if found { Some(combined) } else { None }
     }
 
     pub fn record_discovered_name(&mut self, test_id: &TestIdentity) {
@@ -511,11 +528,13 @@ impl DurationDb {
         if !failed {
             let perf = self.perf[env.to_index()].entry(key).or_default();
             perf.record(timestamp_ms, duration.as_millis() as u64);
-            self.new_perf_samples.push((env, key, timestamp_ms, duration.as_millis() as u64));
+            self.new_perf_samples
+                .push((env, key, timestamp_ms, duration.as_millis() as u64));
         }
         let flake = self.flake[env.to_index()].entry(key).or_default();
         flake.record(failed, failure_class, timestamp_ms);
-        self.new_flake_records.push((env, key, failed, failure_class, timestamp_ms));
+        self.new_flake_records
+            .push((env, key, failed, failure_class, timestamp_ms));
     }
 
     pub fn combine(&mut self, mut other: Self) {
@@ -555,12 +574,21 @@ impl DurationDb {
         let lock_path = self.dir.join("db.lock");
         let mut lock_acquired = false;
         for _ in 0..200 {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
-                Ok(_) => { lock_acquired = true; break; }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => {
+                    lock_acquired = true;
+                    break;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if let Ok(meta) = std::fs::metadata(&lock_path) {
                         if let Ok(mod_time) = meta.modified() {
-                            if mod_time.elapsed().unwrap_or(Duration::ZERO) > Duration::from_secs(10) {
+                            if mod_time.elapsed().unwrap_or(Duration::ZERO)
+                                > Duration::from_secs(10)
+                            {
                                 let _ = std::fs::remove_file(&lock_path);
                             }
                         }
@@ -632,9 +660,15 @@ impl DurationDb {
             }
         }
 
-        let perf_size = std::fs::metadata(&perf_log_path).map(|m| m.len()).unwrap_or(0);
-        let flake_size = std::fs::metadata(&flake_log_path).map(|m| m.len()).unwrap_or(0);
-        let names_size = std::fs::metadata(&names_log_path).map(|m| m.len()).unwrap_or(0);
+        let perf_size = std::fs::metadata(&perf_log_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let flake_size = std::fs::metadata(&flake_log_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let names_size = std::fs::metadata(&names_log_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         if perf_size > 512 * 1024 || flake_size > 512 * 1024 || names_size > 512 * 1024 {
             let db_disk = Self::load(self.dir.clone());
@@ -682,8 +716,15 @@ impl DurationDb {
                             writer.write_all(&k.to_le_bytes())?;
                             writer.write_all(&v.runs.to_le_bytes())?;
                             writer.write_all(&v.failures.to_le_bytes())?;
-                            writer.write_all(&v.last_failure_timestamp_ms.unwrap_or(u64::MAX).to_le_bytes())?;
-                            writer.write_all(&[v.last_failure_class.map(failure_class_to_u8).unwrap_or(0)])?;
+                            writer.write_all(
+                                &v.last_failure_timestamp_ms
+                                    .unwrap_or(u64::MAX)
+                                    .to_le_bytes(),
+                            )?;
+                            writer.write_all(&[v
+                                .last_failure_class
+                                .map(failure_class_to_u8)
+                                .unwrap_or(0)])?;
                         }
                     }
                     writer.flush()?;
@@ -786,7 +827,14 @@ mod tests {
         let mut db = DurationDb::ephemeral();
         let tid = id("m", "t");
         for (i, ms) in [100u64, 200, 300, 400].into_iter().enumerate() {
-            db.record_at(Environment::Local, &tid, Duration::from_millis(ms), false, None, i as u64);
+            db.record_at(
+                Environment::Local,
+                &tid,
+                Duration::from_millis(ms),
+                false,
+                None,
+                i as u64,
+            );
         }
         match db.estimate(Some(Environment::Local), &tid) {
             DurationEstimate::Measured { p50_ms, p95_ms } => {
@@ -795,7 +843,10 @@ mod tests {
             }
             DurationEstimate::Unseen => panic!("should be measured"),
         }
-        assert_eq!(db.estimate(None, &id("m", "absent")), DurationEstimate::Unseen);
+        assert_eq!(
+            db.estimate(None, &id("m", "absent")),
+            DurationEstimate::Unseen
+        );
     }
 
     #[test]
@@ -810,7 +861,14 @@ mod tests {
             Some(FailureClass::Fail),
             1,
         );
-        db.record_at(Environment::Local, &tid, Duration::from_millis(1), false, None, 2);
+        db.record_at(
+            Environment::Local,
+            &tid,
+            Duration::from_millis(1),
+            false,
+            None,
+            2,
+        );
         let f = db.flake(None, &tid).unwrap();
         assert_eq!(f.runs, 2);
         assert_eq!(f.failures, 1);
@@ -821,7 +879,14 @@ mod tests {
     fn cache_replays_are_not_recorded() {
         let mut db = DurationDb::ephemeral();
         let tid = id("m", "t");
-        db.record_at(Environment::Local, &tid, Duration::from_millis(10), false, None, 1);
+        db.record_at(
+            Environment::Local,
+            &tid,
+            Duration::from_millis(10),
+            false,
+            None,
+            1,
+        );
     }
 
     #[test]
@@ -839,7 +904,14 @@ mod tests {
                 Some(FailureClass::Fatal),
                 1,
             );
-            db.record_at(Environment::Local, &tid, Duration::from_millis(250), false, None, 2);
+            db.record_at(
+                Environment::Local,
+                &tid,
+                Duration::from_millis(250),
+                false,
+                None,
+                2,
+            );
             db.flush().unwrap();
         }
         let db = DurationDb::load(dir.clone());
@@ -865,7 +937,14 @@ mod tests {
 
         let mut db = DurationDb::load(dir.clone());
         let tid = id("m", "t");
-        db.record_at(Environment::Local, &tid, Duration::from_millis(5), false, None, 1);
+        db.record_at(
+            Environment::Local,
+            &tid,
+            Duration::from_millis(5),
+            false,
+            None,
+            1,
+        );
 
         let err = db
             .flush()
@@ -887,11 +966,39 @@ mod tests {
         let mut db2 = DurationDb::ephemeral();
         let tid = id("m", "t");
 
-        db1.record_at(Environment::Local, &tid, Duration::from_millis(100), false, None, 1);
-        db1.record_at(Environment::Remote, &tid, Duration::from_millis(150), true, Some(FailureClass::Fail), 2);
+        db1.record_at(
+            Environment::Local,
+            &tid,
+            Duration::from_millis(100),
+            false,
+            None,
+            1,
+        );
+        db1.record_at(
+            Environment::Remote,
+            &tid,
+            Duration::from_millis(150),
+            true,
+            Some(FailureClass::Fail),
+            2,
+        );
 
-        db2.record_at(Environment::Local, &tid, Duration::from_millis(200), false, None, 3);
-        db2.record_at(Environment::Remote, &tid, Duration::from_millis(250), false, None, 4);
+        db2.record_at(
+            Environment::Local,
+            &tid,
+            Duration::from_millis(200),
+            false,
+            None,
+            3,
+        );
+        db2.record_at(
+            Environment::Remote,
+            &tid,
+            Duration::from_millis(250),
+            false,
+            None,
+            4,
+        );
 
         db1.combine(db2);
 

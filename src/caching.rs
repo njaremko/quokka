@@ -30,11 +30,7 @@ impl TestExecutionCaching {
         is_stress: bool,
         attempt_index: u32,
     ) -> Self {
-        if base == CacheClass::Disabled
-            || !is_default_variant
-            || is_stress
-            || attempt_index > 0
-        {
+        if base == CacheClass::Disabled || !is_default_variant || is_stress || attempt_index > 0 {
             TestExecutionCaching::Disabled
         } else {
             TestExecutionCaching::Enabled
@@ -71,14 +67,14 @@ mod tests {
 
     #[test]
     fn cache_class_disabled_for_nonhermetic() {
-        assert_eq!(cache_class(&["rust:flaky".to_owned()]), CacheClass::Disabled);
+        assert_eq!(
+            cache_class(&["rust:flaky".to_owned()]),
+            CacheClass::Disabled
+        );
         assert_eq!(
             cache_class(&["python:uses_network".to_owned()]),
             CacheClass::Disabled
         );
-        assert_eq!(
-            cache_class(&["pkg".to_owned()]),
-            CacheClass::Cacheable
-        );
+        assert_eq!(cache_class(&["pkg".to_owned()]), CacheClass::Cacheable);
     }
 }

@@ -338,8 +338,6 @@ pub fn failure_class(status: TestVerdict) -> Option<FailureClass> {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,11 +345,21 @@ mod tests {
 
     #[test]
     fn test_to_db_key_contains_project_dir_and_separator() {
-        let base_id = TestIdentity { target: "m".into(), name: "t".into(), variant: Variant::Default };
+        let base_id = TestIdentity {
+            target: "m".into(),
+            name: "t".into(),
+            variant: Variant::Default,
+        };
         let key = base_id.to_db_key();
         let proj = project_dir_key();
-        assert!(!proj.is_empty(), "Project directory key should not be empty");
-        assert!(key.starts_with(proj), "Key should start with project directory");
+        assert!(
+            !proj.is_empty(),
+            "Project directory key should not be empty"
+        );
+        assert!(
+            key.starts_with(proj),
+            "Key should start with project directory"
+        );
         assert!(key.contains('\u{2}'), "Key should contain the separator u2");
         assert!(key.contains('\u{1}'), "Key should contain the separator u1");
         let expected = format!("{}\u{2}m\u{1}t", proj);
@@ -360,13 +368,41 @@ mod tests {
 
     #[test]
     fn result_identity_is_unique_across_axes() {
-        let base_id = TestIdentity { target: "m".into(), name: "t".into(), variant: Variant::Default };
-        let asan_id = TestIdentity { target: "m".into(), name: "t".into(), variant: Variant::Asan };
+        let base_id = TestIdentity {
+            target: "m".into(),
+            name: "t".into(),
+            variant: Variant::Default,
+        };
+        let asan_id = TestIdentity {
+            target: "m".into(),
+            name: "t".into(),
+            variant: Variant::Asan,
+        };
 
-        let base = RunIdentity { test: base_id.clone(), repeat: RepeatKind::Once, repeat_index: 0 }.to_buck2_name();
-        let asan = RunIdentity { test: asan_id.clone(), repeat: RepeatKind::Once, repeat_index: 0 }.to_buck2_name();
-        let stress = RunIdentity { test: base_id, repeat: RepeatKind::Stress(NonZeroU32::new(5).unwrap()), repeat_index: 3 }.to_buck2_name();
-        let both = RunIdentity { test: asan_id, repeat: RepeatKind::Stress(NonZeroU32::new(5).unwrap()), repeat_index: 3 }.to_buck2_name();
+        let base = RunIdentity {
+            test: base_id.clone(),
+            repeat: RepeatKind::Once,
+            repeat_index: 0,
+        }
+        .to_buck2_name();
+        let asan = RunIdentity {
+            test: asan_id.clone(),
+            repeat: RepeatKind::Once,
+            repeat_index: 0,
+        }
+        .to_buck2_name();
+        let stress = RunIdentity {
+            test: base_id,
+            repeat: RepeatKind::Stress(NonZeroU32::new(5).unwrap()),
+            repeat_index: 3,
+        }
+        .to_buck2_name();
+        let both = RunIdentity {
+            test: asan_id,
+            repeat: RepeatKind::Stress(NonZeroU32::new(5).unwrap()),
+            repeat_index: 3,
+        }
+        .to_buck2_name();
 
         assert_eq!(base, "t");
         assert_eq!(asan, "t#asan");
@@ -381,10 +417,7 @@ mod tests {
     #[test]
     fn terminal_status_maps_to_countable_wire_values() {
         assert_eq!(TestVerdict::Pass.to_wire(), TestStatus::Pass as i32);
-        assert_eq!(
-            TestVerdict::Timeout.to_wire(),
-            TestStatus::Timeout as i32
-        );
+        assert_eq!(TestVerdict::Timeout.to_wire(), TestStatus::Timeout as i32);
         assert!(TestVerdict::Fail.is_failure());
         // A test that never produced a verdict must not read as a pass.
         assert!(TestVerdict::InfraFailure.is_failure());

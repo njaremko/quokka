@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use std::io::Write;
-use clap::Parser;
 use crate::duration_db::{DurationDb, Environment};
+use clap::Parser;
+use std::io::Write;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "quokka db", about = "Introspect the quokka database")]
@@ -72,36 +72,53 @@ pub fn run_db_command(cli: DbCli) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = resolve_db_path(cli.duration_db);
     match cli.command {
         DbCommand::Stats => run_stats(db_path),
-        DbCommand::List { sort, env, target, name, format } => {
-            run_list(db_path, sort, env, target, name, format)
-        }
+        DbCommand::List {
+            sort,
+            env,
+            target,
+            name,
+            format,
+        } => run_list(db_path, sort, env, target, name, format),
     }
 }
 
 fn run_stats(db_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let db = DurationDb::load(db_path.clone());
     let mut out = std::io::BufWriter::new(std::io::stdout());
-    
+
     // File sizes on disk
-    let perf_bin_sz = std::fs::metadata(db_path.join("perf.bin")).map(|m| m.len()).unwrap_or(0);
-    let perf_log_sz = std::fs::metadata(db_path.join("perf.log")).map(|m| m.len()).unwrap_or(0);
-    let flake_bin_sz = std::fs::metadata(db_path.join("flake.bin")).map(|m| m.len()).unwrap_or(0);
-    let flake_log_sz = std::fs::metadata(db_path.join("flake.log")).map(|m| m.len()).unwrap_or(0);
-    let names_bin_sz = std::fs::metadata(db_path.join("names.bin")).map(|m| m.len()).unwrap_or(0);
-    let names_log_sz = std::fs::metadata(db_path.join("names.log")).map(|m| m.len()).unwrap_or(0);
-    
-    let total_size = perf_bin_sz + perf_log_sz + flake_bin_sz + flake_log_sz + names_bin_sz + names_log_sz;
-    
+    let perf_bin_sz = std::fs::metadata(db_path.join("perf.bin"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let perf_log_sz = std::fs::metadata(db_path.join("perf.log"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let flake_bin_sz = std::fs::metadata(db_path.join("flake.bin"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let flake_log_sz = std::fs::metadata(db_path.join("flake.log"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let names_bin_sz = std::fs::metadata(db_path.join("names.bin"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let names_log_sz = std::fs::metadata(db_path.join("names.log"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let total_size =
+        perf_bin_sz + perf_log_sz + flake_bin_sz + flake_log_sz + names_bin_sz + names_log_sz;
+
     let keys = db.all_keys();
     let total_keys = keys.len();
-    
+
     let mut named_count = 0;
     for &key in &keys {
         if db.get_name(key).is_some() {
             named_count += 1;
         }
     }
-    
+
     // Aggregate total runs and failures
     let mut total_runs = 0;
     let mut total_failures = 0;
@@ -111,10 +128,14 @@ fn run_stats(db_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             total_failures += fr.failures;
         }
     }
-    
+
     let mut print_stats = || -> std::io::Result<()> {
         writeln!(out, "Database directory: {}", db_path.display())?;
-        writeln!(out, "Total size on disk:  {:.2} KB", total_size as f64 / 1024.0)?;
+        writeln!(
+            out,
+            "Total size on disk:  {:.2} KB",
+            total_size as f64 / 1024.0
+        )?;
         writeln!(out, "Total distinct keys: {}", total_keys)?;
         writeln!(out, "Named test records:  {}", named_count)?;
         writeln!(out, "Total test runs:     {}", total_runs)?;
@@ -122,13 +143,13 @@ fn run_stats(db_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         out.flush()?;
         Ok(())
     };
-    
+
     if let Err(e) = print_stats() {
         if e.kind() != std::io::ErrorKind::BrokenPipe {
             return Err(e.into());
         }
     }
-    
+
     Ok(())
 }
 
@@ -141,7 +162,7 @@ fn run_list(
     format: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = DurationDb::load(db_path);
-    
+
     let filter_env = match env.as_deref() {
         Some("local") => Some(Environment::Local),
         Some("remote") => Some(Environment::Remote),
@@ -150,14 +171,20 @@ fn run_list(
             return Err(format!("Invalid env '{}': expected 'local' or 'remote'", other).into());
         }
     };
-    
+
     let mut rows = Vec::new();
     for key in db.all_keys() {
         let name_opt = db.get_name(key);
-        let target = name_opt.map(|n| n.target.clone()).unwrap_or_else(|| format!("<unknown:0x{:x}>", key));
-        let name = name_opt.map(|n| n.name.clone()).unwrap_or_else(|| "".to_owned());
-        let variant = name_opt.map(|n| n.variant.identity().unwrap_or_else(|| "default".to_owned())).unwrap_or_else(|| "".to_owned());
-        
+        let target = name_opt
+            .map(|n| n.target.clone())
+            .unwrap_or_else(|| format!("<unknown:0x{:x}>", key));
+        let name = name_opt
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| "".to_owned());
+        let variant = name_opt
+            .map(|n| n.variant.identity().unwrap_or_else(|| "default".to_owned()))
+            .unwrap_or_else(|| "".to_owned());
+
         // Filter target/name
         if let Some(ref target_pat) = target_filter {
             if !target.contains(target_pat) {
@@ -169,13 +196,15 @@ fn run_list(
                 continue;
             }
         }
-        
+
         let est = db.estimate_by_key(filter_env, key);
         let (p50_ms, p95_ms) = match est {
-            crate::duration_db::DurationEstimate::Measured { p50_ms, p95_ms } => (Some(p50_ms), Some(p95_ms)),
+            crate::duration_db::DurationEstimate::Measured { p50_ms, p95_ms } => {
+                (Some(p50_ms), Some(p95_ms))
+            }
             crate::duration_db::DurationEstimate::Unseen => (None, None),
         };
-        
+
         let (runs, failures, flake_rate) = match db.get_flake_record(filter_env, key) {
             Some(fr) => {
                 let frate = if fr.runs > 0 {
@@ -187,7 +216,7 @@ fn run_list(
             }
             None => (0, 0, 0.0),
         };
-        
+
         rows.push(ListRow {
             key,
             target,
@@ -200,7 +229,7 @@ fn run_list(
             flake_rate,
         });
     }
-    
+
     match sort.as_str() {
         "target" => rows.sort_by(|a, b| a.target.cmp(&b.target).then_with(|| a.name.cmp(&b.name))),
         "name" => rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.target.cmp(&b.target))),
@@ -217,9 +246,9 @@ fn run_list(
             return Err(format!("Invalid sort option '{}'", other).into());
         }
     }
-    
+
     let mut out = std::io::BufWriter::new(std::io::stdout());
-    
+
     if format == "json" {
         let json_str = serde_json::to_string_pretty(&rows)?;
         use std::io::Write;
@@ -236,10 +265,19 @@ fn run_list(
             let _ = out.flush();
             return Ok(());
         }
-        
-        let headers = ["Target", "Test Name", "Variant", "p50 (ms)", "p95 (ms)", "Runs", "Failures", "Flake %"];
+
+        let headers = [
+            "Target",
+            "Test Name",
+            "Variant",
+            "p50 (ms)",
+            "p95 (ms)",
+            "Runs",
+            "Failures",
+            "Flake %",
+        ];
         let mut col_widths = headers.iter().map(|h| h.len()).collect::<Vec<_>>();
-        
+
         for r in &rows {
             col_widths[0] = col_widths[0].max(r.target.len());
             col_widths[1] = col_widths[1].max(r.name.len());
@@ -250,7 +288,7 @@ fn run_list(
             col_widths[6] = col_widths[6].max(r.failures.to_string().len());
             col_widths[7] = col_widths[7].max(format!("{:.1}%", r.flake_rate).len());
         }
-        
+
         let mut print_row = |vals: &[String]| -> std::io::Result<()> {
             use std::io::Write;
             for (i, val) in vals.iter().enumerate() {
@@ -265,7 +303,7 @@ fn run_list(
             writeln!(out)?;
             Ok(())
         };
-        
+
         let handle_err = |e: std::io::Error| -> Result<(), Box<dyn std::error::Error>> {
             if e.kind() == std::io::ErrorKind::BrokenPipe {
                 Ok(())
@@ -273,21 +311,30 @@ fn run_list(
                 Err(e.into())
             }
         };
-        
+
         if let Err(e) = print_row(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>()) {
             return handle_err(e);
         }
-        
-        let separator = col_widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>();
+
+        let separator = col_widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>();
         if let Err(e) = print_row(&separator) {
             return handle_err(e);
         }
-        
+
         for r in &rows {
-            let p50_str = r.p50_ms.map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_owned());
-            let p95_str = r.p95_ms.map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_owned());
+            let p50_str = r
+                .p50_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "N/A".to_owned());
+            let p95_str = r
+                .p95_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "N/A".to_owned());
             let flake_str = format!("{:.1}%", r.flake_rate);
-            
+
             let vals = vec![
                 r.target.clone(),
                 r.name.clone(),
@@ -303,7 +350,7 @@ fn run_list(
             }
         }
     }
-    
+
     let _ = out.flush();
     Ok(())
 }
@@ -319,7 +366,7 @@ mod tests {
     fn test_db_cli_stats_and_list() {
         let dir = std::env::temp_dir().join(format!("quokka-db-cli-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        
+
         let tid1 = TestIdentity {
             target: "//src:quokka-lib-test".to_owned(),
             name: "test_1".to_owned(),
@@ -330,7 +377,7 @@ mod tests {
             name: "test_2_flaky".to_owned(),
             variant: Variant::Asan,
         };
-        
+
         {
             let mut db = DurationDb::load(dir.clone());
             db.record_at(
@@ -359,29 +406,35 @@ mod tests {
             );
             db.flush().unwrap();
         }
-        
+
         // Test stats
         assert!(run_stats(dir.clone()).is_ok());
-        
+
         // Test list text format
-        assert!(run_list(
-            dir.clone(),
-            "target".to_owned(),
-            None,
-            None,
-            None,
-            "text".to_owned(),
-        ).is_ok());
-        
+        assert!(
+            run_list(
+                dir.clone(),
+                "target".to_owned(),
+                None,
+                None,
+                None,
+                "text".to_owned(),
+            )
+            .is_ok()
+        );
+
         // Test list JSON format
-        assert!(run_list(
-            dir.clone(),
-            "flake-rate".to_owned(),
-            Some("local".to_owned()),
-            Some("quokka".to_owned()),
-            Some("flaky".to_owned()),
-            "json".to_owned(),
-        ).is_ok());
+        assert!(
+            run_list(
+                dir.clone(),
+                "flake-rate".to_owned(),
+                Some("local".to_owned()),
+                Some("quokka".to_owned()),
+                Some("flaky".to_owned()),
+                "json".to_owned(),
+            )
+            .is_ok()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

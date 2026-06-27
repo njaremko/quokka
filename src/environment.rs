@@ -44,7 +44,9 @@ impl HardwareNeeds {
 
         // For now, GPU and Large Mem are mutually exclusive queues in buck2 for this project.
         if merged.requires_gpu && merged.requires_large_mem {
-            return Err(ConstraintConflictError("Cannot satisfy both gpu and large-mem hardware needs."));
+            return Err(ConstraintConflictError(
+                "Cannot satisfy both gpu and large-mem hardware needs.",
+            ));
         }
 
         Ok(merged)
@@ -71,7 +73,10 @@ pub struct SchedulingProfile {
 }
 
 impl SchedulingProfile {
-    pub fn combine(mut self, other: SchedulingProfile) -> Result<SchedulingProfile, ConstraintConflictError> {
+    pub fn combine(
+        mut self,
+        other: SchedulingProfile,
+    ) -> Result<SchedulingProfile, ConstraintConflictError> {
         self.hardware = self.hardware.combine(other.hardware)?;
         if other.exclusivity == HostExclusivity::Exclusive {
             self.exclusivity = HostExclusivity::Exclusive;
@@ -82,7 +87,9 @@ impl SchedulingProfile {
 }
 
 // Temporary parser logic for labels (until label parsing is centralized).
-pub fn profile_from_labels(labels: &[String]) -> Result<SchedulingProfile, ConstraintConflictError> {
+pub fn profile_from_labels(
+    labels: &[String],
+) -> Result<SchedulingProfile, ConstraintConflictError> {
     let mut profile = SchedulingProfile::default();
 
     for l in labels {
@@ -130,7 +137,8 @@ mod tests {
         let req = profile_from_labels(&[
             "rust:local-resource=postgres".to_owned(),
             "python:local-resource=redis".to_owned(),
-        ]).unwrap();
+        ])
+        .unwrap();
         let mut expected = BTreeSet::new();
         expected.insert("postgres".to_owned());
         expected.insert("redis".to_owned());

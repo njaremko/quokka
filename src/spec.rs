@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use crate::ids::TargetHandle;
-use crate::proto::test::{ConfiguredTargetHandle, ExternalRunnerSpec, ExternalRunnerSpecValue};
 use crate::proto::test::external_runner_spec_value::Value;
+use crate::proto::test::{ConfiguredTargetHandle, ExternalRunnerSpec, ExternalRunnerSpecValue};
 
 /// An argument in a command or environment, abstracted away from buck2 protobufs.
 #[derive(Debug, Clone, PartialEq, Eq)]

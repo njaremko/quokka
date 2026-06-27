@@ -9,7 +9,6 @@
 
 use std::time::Duration;
 
-
 use crate::environment::{HardwareNeeds, HostExclusivity, SchedulingProfile};
 use crate::proto::test::arg_value_content::Value as ArgContent;
 use crate::proto::test::external_runner_spec_value::Value as SpecValue;
@@ -115,22 +114,36 @@ fn duration_to_proto(d: Duration) -> prost_types::Duration {
 
 fn executor_override_proto(hardware: &HardwareNeeds) -> Option<ExecutorConfigOverride> {
     if hardware.local_debug {
-        Some(ExecutorConfigOverride { name: "rust-local-debug".into() })
+        Some(ExecutorConfigOverride {
+            name: "rust-local-debug".into(),
+        })
     } else if hardware.listing_only {
-        Some(ExecutorConfigOverride { name: "rust-listing".into() })
+        Some(ExecutorConfigOverride {
+            name: "rust-listing".into(),
+        })
     } else if hardware.requires_gpu {
-        Some(ExecutorConfigOverride { name: "rust-test-gpu".into() })
+        Some(ExecutorConfigOverride {
+            name: "rust-test-gpu".into(),
+        })
     } else if hardware.requires_large_mem {
-        Some(ExecutorConfigOverride { name: "rust-test-large".into() })
+        Some(ExecutorConfigOverride {
+            name: "rust-test-large".into(),
+        })
     } else if hardware.network_isolated {
-        Some(ExecutorConfigOverride { name: "rust-test-network-private".into() })
+        Some(ExecutorConfigOverride {
+            name: "rust-test-network-private".into(),
+        })
     } else {
         None
     }
 }
 
-fn host_sharing_proto(exclusivity: HostExclusivity) -> crate::proto::host_sharing::HostSharingRequirements {
-    use crate::proto::host_sharing::host_sharing_requirements::{ExclusiveAccess, Requirements, Shared};
+fn host_sharing_proto(
+    exclusivity: HostExclusivity,
+) -> crate::proto::host_sharing::HostSharingRequirements {
+    use crate::proto::host_sharing::host_sharing_requirements::{
+        ExclusiveAccess, Requirements, Shared,
+    };
     use crate::proto::host_sharing::weight_class::Value as WeightValue;
     use crate::proto::host_sharing::{HostSharingRequirements, WeightClass};
 
@@ -176,12 +189,14 @@ pub fn build_listing_request(
     };
     ExecuteRequest2 {
         timeout: Some(duration_to_proto(timeout)),
-        host_sharing_requirements: Some(host_sharing_proto(
-            profile.exclusivity,
-        )),
+        host_sharing_requirements: Some(host_sharing_proto(profile.exclusivity)),
         test_executable: Some(test_executable),
         executor_override: executor_override_proto(&profile.hardware),
-        required_local_resources: profile.local_resources.iter().map(|r| LocalResourceType { name: r.clone() }).collect(),
+        required_local_resources: profile
+            .local_resources
+            .iter()
+            .map(|r| LocalResourceType { name: r.clone() })
+            .collect(),
         // This field is the *test-execution* caching toggle (the Testing stage);
         // the listing's own cacheability is the `cacheable: false` above. Leave
         // this at its default — it is inert for a Listing stage.
@@ -222,12 +237,15 @@ pub fn build_testing_request(req: TestingRequest) -> ExecuteRequest2 {
     };
     ExecuteRequest2 {
         timeout: Some(duration_to_proto(req.timeout)),
-        host_sharing_requirements: Some(host_sharing_proto(
-            req.profile.exclusivity,
-        )),
+        host_sharing_requirements: Some(host_sharing_proto(req.profile.exclusivity)),
         test_executable: Some(test_executable),
         executor_override: executor_override_proto(&req.profile.hardware),
-        required_local_resources: req.profile.local_resources.iter().map(|r| LocalResourceType { name: r.clone() }).collect(),
+        required_local_resources: req
+            .profile
+            .local_resources
+            .iter()
+            .map(|r| LocalResourceType { name: r.clone() })
+            .collect(),
         disable_test_execution_caching: req.caching.disable_flag(),
     }
 }
@@ -235,8 +253,8 @@ pub fn build_testing_request(req: TestingRequest) -> ExecuteRequest2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::variant::Variant;
     use crate::proto::test::external_runner_spec_value::Value;
+    use crate::variant::Variant;
     use std::sync::Arc;
 
     fn spec_with_handle_command() -> Arc<TargetSpec> {
@@ -358,7 +376,6 @@ mod tests {
 
     #[test]
     fn stress_sets_repeat_count_and_disables_cache() {
-
         let spec = spec_with_handle_command();
         let req = build_testing_request(TestingRequest {
             target: ConfiguredTargetHandle { id: spec.handle.0 },

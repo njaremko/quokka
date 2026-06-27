@@ -79,22 +79,21 @@ pub async fn drive_to_completion(
     config: RunnerConfig,
     context: crate::cli::SessionContext,
 ) {
-    let exit_code =
-        match std::panic::AssertUnwindSafe(crate::scheduler::run(
-            orch.clone(),
-            intake_rx,
-            config,
-            context,
-        ))
-            .catch_unwind()
-            .await
-        {
-            Ok(code) => code,
-            Err(_) => {
-                eprintln!("quokka: scheduler panicked; reporting failure");
-                SCHEDULER_PANIC_EXIT
-            }
-        };
+    let exit_code = match std::panic::AssertUnwindSafe(crate::scheduler::run(
+        orch.clone(),
+        intake_rx,
+        config,
+        context,
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("quokka: scheduler panicked; reporting failure");
+            SCHEDULER_PANIC_EXIT
+        }
+    };
 
     if let Err(e) = orch.end_of_test_results(exit_code).await {
         eprintln!("quokka: failed to send end_of_test_results: {e:#}");

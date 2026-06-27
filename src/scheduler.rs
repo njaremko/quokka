@@ -928,15 +928,17 @@ enum GroupOutcome {
     Observed {
         observations: FxHashMap<String, PerTestObservation>,
         raw: ProcessOutcome,
-        /// Whether the action emitted any stdout. A cache replay drops stdout
-        /// (buck2 keeps only the cached exit status), so empty stdout means the
-        /// per-test output was dropped, not that the harness produced none. A
-        /// fresh run that DID emit stdout but yielded no parseable result for a
-        /// requested test lost or mangled its output (see `absent_name_verdict`).
-        produced_stdout: bool,
-        /// Bounded tail of the action's stderr. Used to explain a synthesized
-        /// (no-result) failure: an aborted test's panic message lands here, not
-        /// in any parseable harness result.
+        /// Whether the action emitted stdout or stderr. A cache replay drops both
+        /// streams (buck2 keeps only the cached exit status), so no action output
+        /// means the per-test output was dropped, not that the harness produced
+        /// none. A fresh run that DID emit output but yielded no parseable result
+        /// for a requested test lost or mangled its output.
+        produced_output: bool,
+        /// Action stdout. For a synthesized singleton failure this is the only
+        /// stream the scheduler can show.
+        stdout: String,
+        /// Action stderr. A failed action can write panic/backtrace output here
+        /// even when the harness produced a parseable per-test failure.
         stderr: String,
         execution_time: Duration,
         max_memory: Option<u64>,
@@ -951,6 +953,58 @@ enum GroupOutcome {
     },
 }
 
+fn append_labeled_output(details: &mut String, label: &str, output: &str) {
+    let output = output.trim();
+    if output.is_empty() {
+        return;
+    }
+    if !details.is_empty() && !details.ends_with('\n') {
+        details.push('\n');
+    }
+    details.push_str("---- ");
+    details.push_str(label);
+    details.push_str(" ----\n");
+    details.push_str(output);
+}
+
+/// Combine a synthesized-verdict explanation with the action streams when the
+/// streams belong to one test. A singleton that aborts (panic = abort, or a
+/// panic on a non-test thread that `catch_unwind` cannot intercept) emits no
+/// per-test harness result, so its verdict is derived from the exit code. The
+/// action streams are then the only failure record and must be reported without
+/// elision. Batched streams are not name-attributable, so callers pass empty
+/// streams and let isolation reruns recover per-test output.
+fn absent_failure_details(reason: &str, stdout: Option<&str>, stderr: Option<&str>) -> String {
+    let mut details = reason.to_owned();
+    if let Some(stdout) = stdout {
+        append_labeled_output(&mut details, "action stdout", stdout);
+    }
+    if let Some(stderr) = stderr {
+        append_labeled_output(&mut details, "action stderr", stderr);
+    }
+    details
+}
+
+/// Parsed harness details own action stdout, but action stderr is a separate
+/// process stream. Preserve it on singleton failures unless the translator
+/// already copied the same stderr into the per-test details. Batched action
+/// stderr is intentionally not copied to each failed member because it is not
+/// name-attributed and may be large.
+fn failure_details_with_action_stderr(
+    details: String,
+    stderr: &str,
+    include_action_stderr: bool,
+) -> String {
+    let stderr = stderr.trim();
+    if !include_action_stderr || stderr.is_empty() || details.contains(stderr) {
+        details
+    } else {
+        let mut details = details;
+        append_labeled_output(&mut details, "action stderr", stderr);
+        details
+    }
+}
+
 /// Verdict for a requested test name that the harness produced no parsed result
 /// for. The exit code is the name's authoritative verdict in exactly two cases:
 ///
@@ -958,84 +1012,54 @@ enum GroupOutcome {
 ///   (`<doctests>`/`<binary>`) whose verdict IS the process exit code — there is
 ///   no per-test line to expect for it (an empty doc-test run, or a custom
 ///   binary whose exit code is the whole result).
-/// - `!produced_stdout`: the action emitted no stdout at all. A cache replay
-///   drops stdout (buck2 keeps only the cached exit status), so an absent name
-///   on a clean cached exit genuinely passed.
+/// - `!produced_output`: the action emitted no stdout or stderr at all. A cache
+///   replay drops both streams (buck2 keeps only the cached exit status), so an
+///   absent name on a clean cached exit genuinely passed.
 ///
-/// Otherwise the run is a fresh per-test execution that DID emit stdout, yet we
+/// Otherwise the run is a fresh per-test execution that DID emit output, yet we
 /// could not parse a result for this name — the harness output was not the JSON
 /// we expect, or this test's line was lost. A clean exit must NOT be read as a
 /// pass; we have no evidence the test passed, so it is FATAL. (Reading exit 0 as
 /// a pass here is the "non-JSON stdout silently passes" bug.)
-/// Cap on the action stderr retained to explain a synthesized (no-result)
-/// failure. A panic message plus a short backtrace is a few KiB; this bounds a
-/// pathologically chatty test from inflating the retained tail.
-const ABSENT_FAILURE_STDERR_TAIL_MAX_BYTES: usize = 64 * 1024;
-
-/// Last `max_bytes` of an action's stderr as a lossy string (the whole thing when
-/// smaller), prefixed with an elision marker on truncation. The panic line a Rust
-/// process prints on abort sits near the end of stderr, so the tail is what
-/// carries the failure reason.
-fn bounded_stderr_tail(bytes: &[u8], max_bytes: usize) -> String {
-    if bytes.len() <= max_bytes {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let tail = &bytes[bytes.len() - max_bytes..];
-    format!(
-        "…[stderr truncated to last {max_bytes} bytes]\n{}",
-        String::from_utf8_lossy(tail)
-    )
-}
-
-/// Combine a synthesized-verdict explanation with the action's stderr. A test
-/// that aborts (panic = abort, or a panic on a non-test thread that `catch_unwind`
-/// cannot intercept) emits no per-test harness result, so its verdict is derived
-/// from the exit code — but the panic message it wrote to stderr is the actual
-/// failure reason and must not be dropped. Returns the reason alone when stderr is
-/// empty.
-fn absent_failure_details(reason: &str, stderr: &str) -> String {
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        reason.to_owned()
-    } else {
-        format!("{reason}\n---- action stderr ----\n{stderr}")
-    }
-}
-
 fn absent_name_verdict(
     raw: ProcessOutcome,
     whole_unit: bool,
-    produced_stdout: bool,
+    produced_output: bool,
     singleton: bool,
+    stdout: &str,
     stderr: &str,
 ) -> (TestVerdict, String) {
+    let attributed_stdout = singleton.then_some(stdout);
+    let attributed_stderr = singleton.then_some(stderr);
     match raw {
-        ProcessOutcome::Finished { exit_code: 0 } if whole_unit || !produced_stdout => {
+        ProcessOutcome::Finished { exit_code: 0 } if whole_unit || !produced_output => {
             (TestVerdict::Pass, String::new())
         }
         ProcessOutcome::Finished { exit_code: 0 } => (
             TestVerdict::Fatal,
             absent_failure_details(
                 "harness exited 0 but emitted no parseable result for this test",
-                stderr,
+                attributed_stdout,
+                attributed_stderr,
             ),
         ),
         // A nonzero exit for a singleton is that test's failure; for a
         // multi-member batch it cannot be attributed, so the member is FATAL and
         // the caller's per-test isolation re-run resolves it with a precise
         // singleton exit code. In both cases the process emitted no parseable
-        // result, so the only record of *why* is the stderr it wrote before
-        // exiting — surface it instead of an empty detail.
+        // result; singleton streams are the only record of *why*, while batched
+        // streams must not be copied to every member.
         ProcessOutcome::Finished { exit_code } if singleton => (
             TestVerdict::Fail,
             absent_failure_details(
                 &format!("test process exited {exit_code} with no harness-reported result"),
-                stderr,
+                attributed_stdout,
+                attributed_stderr,
             ),
         ),
         ProcessOutcome::Finished { .. } => (
             TestVerdict::Fatal,
-            absent_failure_details("test produced no result in batch output", stderr),
+            absent_failure_details("test produced no result in batch output", None, None),
         ),
         ProcessOutcome::TimedOut { .. } => (TestVerdict::Timeout, "execution timed out".to_owned()),
     }
@@ -1204,15 +1228,17 @@ async fn run_group(
         match response {
             Ok(response) => match decode_response(response) {
                 Execute2Outcome::Completed(action) => {
+                    let observations = plan
+                        .translator
+                        .parse_results(&action.stdout, &action.stderr);
+                    let produced_output = !action.stdout.is_empty() || !action.stderr.is_empty();
+                    let stdout = String::from_utf8_lossy(&action.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&action.stderr).into_owned();
                     return GroupOutcome::Observed {
-                        observations: plan
-                            .translator
-                            .parse_results(&action.stdout, &action.stderr),
-                        produced_stdout: !action.stdout.is_empty(),
-                        stderr: bounded_stderr_tail(
-                            &action.stderr,
-                            ABSENT_FAILURE_STDERR_TAIL_MAX_BYTES,
-                        ),
+                        observations,
+                        produced_output,
+                        stdout,
+                        stderr,
                         raw: action.status,
                         execution_time: action.execution_time,
                         max_memory: action.max_memory_used_bytes,
@@ -1294,7 +1320,8 @@ async fn execute_test_action(
             GroupOutcome::Observed {
                 observations,
                 raw,
-                produced_stdout,
+                produced_output,
+                stdout,
                 stderr,
                 execution_time,
                 max_memory,
@@ -1321,13 +1348,25 @@ async fn execute_test_action(
                 let singleton = !is_batched || test_names.len() == 1;
                 for name in &test_names {
                     let (status, details, from_harness) = match observations.get(name) {
-                        Some(obs) => (obs.status, obs.details.clone(), true),
+                        Some(obs) => {
+                            let details = if obs.status.is_failure() {
+                                failure_details_with_action_stderr(
+                                    obs.details.clone(),
+                                    &stderr,
+                                    singleton,
+                                )
+                            } else {
+                                obs.details.clone()
+                            };
+                            (obs.status, details, true)
+                        }
                         None => {
                             let (status, details) = absent_name_verdict(
                                 raw,
                                 is_whole_target,
-                                produced_stdout,
+                                produced_output,
                                 singleton,
+                                &stdout,
                                 &stderr,
                             );
                             (status, details, false)
@@ -1881,28 +1920,37 @@ mod tests {
     fn verdict(
         raw: ProcessOutcome,
         whole_unit: bool,
-        produced_stdout: bool,
+        produced_output: bool,
         singleton: bool,
     ) -> TestVerdict {
-        absent_name_verdict(raw, whole_unit, produced_stdout, singleton, "").0
+        absent_name_verdict(raw, whole_unit, produced_output, singleton, "", "").0
     }
 
     #[test]
-    fn absent_singleton_failure_surfaces_action_stderr() {
+    fn absent_singleton_failure_surfaces_action_output() {
         // A singleton test that aborts (panic = abort, or a panic on a worker
         // thread that `catch_unwind` cannot intercept) emits no per-test harness
-        // result, so its verdict is synthesized from the nonzero exit. The panic
-        // message — the actual failure reason — is on the action's stderr and must
-        // be surfaced, not dropped to an empty detail (which left `buck2 test`
-        // printing a bare "✗ Fail" with no cause).
+        // result, so its verdict is synthesized from the nonzero exit. The
+        // output streams are the only failure record and must be surfaced, not
+        // dropped to an empty detail (which left `buck2 test` printing a bare
+        // "Fail" with no cause).
         let raw = ProcessOutcome::Finished { exit_code: 134 }; // SIGABRT
+        let stdout = "running 1 test\nworker stdout before abort";
         let stderr = "thread 'main' panicked at regression.rs:6171:9:\n\
                       step 61 getCellValueText {row=0,col=0} expected \"1\" but got \"\"";
-        let (status, details) = absent_name_verdict(raw, false, true, true, stderr);
+        let (status, details) = absent_name_verdict(raw, false, true, true, stdout, stderr);
         assert_eq!(status, TestVerdict::Fail);
+        assert!(
+            details.contains("worker stdout before abort"),
+            "failure detail must carry the action stdout; got: {details:?}"
+        );
         assert!(
             details.contains("getCellValueText {row=0,col=0} expected"),
             "failure detail must carry the action stderr; got: {details:?}"
+        );
+        assert!(
+            details.contains("---- action stdout ----"),
+            "got: {details:?}"
         );
         assert!(
             details.contains("---- action stderr ----"),
@@ -1915,10 +1963,56 @@ mod tests {
         // With no stderr the synthesized failure still names the exit code rather
         // than reporting an empty detail.
         let raw = ProcessOutcome::Finished { exit_code: 101 };
-        let (status, details) = absent_name_verdict(raw, false, true, true, "");
+        let (status, details) = absent_name_verdict(raw, false, true, true, "", "");
         assert_eq!(status, TestVerdict::Fail);
         assert!(!details.is_empty(), "got: {details:?}");
         assert!(details.contains("101"), "got: {details:?}");
+    }
+
+    #[test]
+    fn batched_absent_failure_does_not_copy_shared_action_output() {
+        // A non-singleton action stream is not name-attributed. Copying it into
+        // every missing member both mislabels the source and multiplies large
+        // logs; the isolate policy reruns the failing members singly to recover
+        // per-test output.
+        let raw = ProcessOutcome::Finished { exit_code: 101 };
+        let (status, details) = absent_name_verdict(
+            raw,
+            false,
+            true,
+            false,
+            "shared batch stdout",
+            "shared batch stderr",
+        );
+        assert_eq!(status, TestVerdict::Fatal);
+        assert!(details.contains("batch output"), "got: {details:?}");
+        assert!(!details.contains("shared batch stdout"), "got: {details:?}");
+        assert!(!details.contains("shared batch stderr"), "got: {details:?}");
+    }
+
+    #[test]
+    fn parsed_batch_failure_does_not_copy_shared_action_stderr() {
+        let details = failure_details_with_action_stderr(
+            "per-test failure".to_owned(),
+            "shared stderr",
+            false,
+        );
+        assert_eq!(details, "per-test failure");
+    }
+
+    #[test]
+    fn stderr_only_fresh_output_is_never_a_pass() {
+        // Buck cache replays drop both streams. If a fresh action emits stderr,
+        // even with empty stdout and exit 0, there was output we could not
+        // attribute to a passing harness result.
+        let raw = ProcessOutcome::Finished { exit_code: 0 };
+        let stderr = "panic hook wrote to stderr without a JSON result";
+        let (status, details) = absent_name_verdict(raw, false, true, true, "", stderr);
+        assert_eq!(status, TestVerdict::Fatal);
+        assert!(
+            details.contains("panic hook wrote to stderr"),
+            "got: {details:?}"
+        );
     }
 
     #[test]
@@ -1926,7 +2020,7 @@ mod tests {
         // The reported bug: a per-test (non-whole-unit) run that emitted stdout
         // but no parseable result for this name must not be read as a pass on a
         // clean exit — there is no evidence the test passed.
-        // verdict(raw, whole_unit, produced_stdout, singleton)
+        // verdict(raw, whole_unit, produced_output, singleton)
         let fresh_garbage = ProcessOutcome::Finished { exit_code: 0 };
         assert_eq!(
             verdict(fresh_garbage, false, true, true),
@@ -1947,8 +2041,9 @@ mod tests {
 
     #[test]
     fn cache_replay_trusts_the_exit_code() {
-        // A cache replay drops stdout (produced_stdout == false); the cached exit
-        // status is authoritative, so an absent name on exit 0 passed.
+        // A cache replay drops both streams (produced_output == false); the
+        // cached exit status is authoritative, so an absent name on exit 0
+        // passed.
         assert_eq!(
             verdict(
                 ProcessOutcome::Finished { exit_code: 0 },
