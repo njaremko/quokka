@@ -29,6 +29,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt as _;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::Level;
@@ -64,6 +65,9 @@ const INFRA_MAX_ATTEMPTS: u32 = 3;
 /// Neutral duration (ms) assigned to tests with no history, so a cold cache
 /// neither starves nor over-prioritizes them.
 const UNSEEN_WEIGHT_MS: u64 = 50;
+/// Substituted as a failing test's details when the harness reported a failure
+/// but captured no output, so a failure never surfaces with an empty cause.
+const NO_OUTPUT_FAILURE_DETAIL: &str = "test reported FAILED with no captured stdout/stderr";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunVerdict {
@@ -105,6 +109,12 @@ struct DbObservation {
 enum ReporterMessage {
     Finished(Vec<FinishedTest>),
     Discovered(Vec<TestIdentity>),
+    /// A target that could not even be started — a spec buck2 sent that we
+    /// cannot parse into a handle. With no handle it cannot be a `TestResult`,
+    /// so the reporter (the sole verdict owner) fails the run closed and
+    /// surfaces the cause on the console, rather than letting the target vanish
+    /// as a silent green pass.
+    TargetDropped(String),
 }
 
 /// One finished test, ready for the reporter to write and fold.
@@ -174,7 +184,23 @@ pub async fn run(
     // their results, so folding only what arrived could otherwise read green.
     let any_target_panicked = drain_joinset(&mut target_tasks).await;
     drop(report_tx);
-    let mut verdict = reporter.await.unwrap_or(RunVerdict::Fail);
+    // A reporter that died (panicked) fails the run closed — but name the cause
+    // on the console, otherwise the operator sees only an unexplained red build
+    // and any results still queued when it died are lost with no trace.
+    let mut verdict = match reporter.await {
+        Ok(verdict) => verdict,
+        Err(e) => {
+            let _ = orch
+                .console(
+                    Level::ERROR,
+                    format!(
+                        "quokka: reporter task failed ({e}); some test results may have been lost. Failing the run."
+                    ),
+                )
+                .await;
+            RunVerdict::Fail
+        }
+    };
     if any_target_panicked {
         verdict = RunVerdict::Fail;
     }
@@ -303,6 +329,22 @@ async fn reporter_task(
                 for tid in tids {
                     db.record_discovered_name(&tid);
                 }
+            }
+            ReporterMessage::TargetDropped(reason) => {
+                // Fail the run closed: a dropped target must never read green.
+                verdict = RunVerdict::Fail;
+                // Count it so the session summary reconciles with the failing
+                // verdict (otherwise a red run would print "0 failed"). There is
+                // no per-test handle, so it is counted as one failed unit.
+                tally.total += 1;
+                tally.failed += 1;
+                // The console is the only terminal channel for a handle-less
+                // failure (there is no TestResult to carry details). Best-effort,
+                // like the other console emits in this task; reported at ERROR
+                // because it fails the build.
+                let _ = orch
+                    .console(Level::ERROR, format!("quokka: {reason}"))
+                    .await;
             }
             ReporterMessage::Finished(batch) => {
                 for finished in batch {
@@ -439,13 +481,23 @@ impl TargetBatchMode {
 }
 
 impl TargetPlan {
-    fn derive(spec: Arc<TargetSpec>, config: &RunnerConfig, registry: &TranslatorRegistry) -> Self {
+    /// Derive the per-target plan, or `Err` with an operator-facing reason when
+    /// the target cannot be run at all. An unregistered `test_type` is a
+    /// configuration error, not a runner bug: it is reported as a FATAL target
+    /// result (see [`run_target`]) rather than panicking into an anonymous
+    /// task-join error that fails the build with no attributable cause.
+    fn derive(
+        spec: Arc<TargetSpec>,
+        config: &RunnerConfig,
+        registry: &TranslatorRegistry,
+    ) -> Result<Self, String> {
         let labels: &[String] = &spec.labels;
-        let translator = registry
-            .resolve(&spec.test_type, config)
-            .unwrap_or_else(|| {
-                panic!("No translator registered for test_type: {}", spec.test_type)
-            });
+        let Some(translator) = registry.resolve(&spec.test_type, config) else {
+            return Err(format!(
+                "no translator registered for test_type '{}'",
+                spec.test_type
+            ));
+        };
         // The `rust:stress` label means "run this target repeatedly". A global
         // `--stress N` takes precedence (it stresses every target); otherwise the
         // label opts this target into the configured per-label repetition count.
@@ -456,7 +508,7 @@ impl TargetPlan {
         } else {
             RepeatKind::Once
         };
-        TargetPlan {
+        Ok(TargetPlan {
             translator,
             ignored: config.ignored,
             cache_class: caching::cache_class(labels),
@@ -474,7 +526,7 @@ impl TargetPlan {
             batch_mode: target_batch_mode(labels),
             repeat,
             spec,
-        }
+        })
     }
 
     fn listing_profile(&self, config: &RunnerConfig) -> SchedulingProfile {
@@ -525,14 +577,80 @@ async fn run_target(ctx: TargetCtx, spec_proto: crate::proto::test::ExternalRunn
     let spec = match TargetSpec::from_proto(spec_proto) {
         Ok(spec) => spec,
         Err(e) => {
-            eprintln!("quokka: dropping malformed spec: {e}");
+            // A spec we cannot parse has no handle, so it cannot be reported as
+            // a TestResult. Route it to the reporter (the verdict owner) so the
+            // run fails closed and the cause is surfaced on the console, instead
+            // of dropping the whole target as a silent green pass. A closed
+            // channel means the reporter already died, which the run loop turns
+            // into a failing verdict.
+            let _ = ctx
+                .report_tx
+                .send(ReporterMessage::TargetDropped(format!(
+                    "dropping malformed spec: {e}"
+                )))
+                .await;
             return;
         }
     };
     let registry = TranslatorRegistry::new();
-    let plan = Arc::new(TargetPlan::derive(spec, &ctx.config, &registry));
+    let plan = match TargetPlan::derive(spec.clone(), &ctx.config, &registry) {
+        Ok(plan) => Arc::new(plan),
+        Err(reason) => {
+            // The target cannot be run (e.g. unregistered test_type). Surface it
+            // as a FATAL result keyed to the target — the cause is visible and
+            // the run fails closed — instead of panicking into an anonymous
+            // task-join error with no attributable cause. This is a structural
+            // inability to run the target, NOT the quarantined test flaking, so
+            // it is non-suppressible (`quarantined = false`): a quarantine label
+            // must not turn a broken target into a green build.
+            report_target_failure_for_spec(
+                &ctx,
+                &spec,
+                /* quarantined */ false,
+                RepeatKind::Once,
+                TestVerdict::Fatal,
+                reason,
+            )
+            .await;
+            return;
+        }
+    };
 
-    run_per_test_target(&ctx, plan).await;
+    // Safety net: a panic in the target driver (outside the inner action tasks,
+    // which already report their own panics via the inner `drain_joinset`, so
+    // such panics never unwind to here — no double-report) must surface as a
+    // reported FATAL naming this target, not vanish into the anonymous top-level
+    // task-join error. Like the unregistered-test_type case, a runner panic is a
+    // structural failure, not the quarantined test flaking, so it is
+    // non-suppressible. The outer `drain_joinset` still forces a failing verdict
+    // as a backstop for any panic this cannot catch (e.g. in this wrapper).
+    if let Err(payload) = std::panic::AssertUnwindSafe(run_per_test_target(&ctx, plan.clone()))
+        .catch_unwind()
+        .await
+    {
+        report_target_failure_for_spec(
+            &ctx,
+            &plan.spec,
+            /* quarantined */ false,
+            plan.repeat,
+            TestVerdict::Fatal,
+            format!("target driver panicked: {}", panic_message(&payload)),
+        )
+        .await;
+    }
+}
+
+/// Extract a bounded, human-readable message from a caught panic payload. Panic
+/// payloads are conventionally `&'static str` or `String`; anything else is
+/// reported generically rather than risking a second panic trying to format it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    }
 }
 
 async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
@@ -640,6 +758,18 @@ async fn run_per_test_target(ctx: &TargetCtx, plan: Arc<TargetPlan>) {
             Some(Ok(Execute2Outcome::CancelledUnspecified)) => {
                 report_target_failure(ctx, &plan, TestVerdict::Omitted, "listing cancelled".into())
                     .await;
+                return;
+            }
+            Some(Ok(Execute2Outcome::Malformed(reason))) => {
+                // A malformed listing response must fail the target closed, not
+                // drop its tests as a green pass.
+                report_target_failure(
+                    ctx,
+                    &plan,
+                    TestVerdict::InfraFailure,
+                    format!("listing failed: {}", reason.detail()),
+                )
+                .await;
                 return;
             }
 
@@ -1268,6 +1398,15 @@ async fn run_group(
                         details: "run cancelled".to_owned(),
                     };
                 }
+                Execute2Outcome::Malformed(reason) => {
+                    // A response we cannot interpret is an infra failure, not a
+                    // silent omission: failing closed keeps a corrupt boundary
+                    // message from reading as a passing test.
+                    return GroupOutcome::GroupFailed {
+                        status: TestVerdict::InfraFailure,
+                        details: reason.detail(),
+                    };
+                }
             },
             Err(e) => {
                 return GroupOutcome::GroupFailed {
@@ -1566,7 +1705,17 @@ async fn make_finished(
         repeat: plan.repeat,
         repeat_index,
     };
-    let mut details = finalize_details(ctx, DetailKind::of(outcome.status), outcome.details).await;
+    // A failing test must never report with an empty cause: a bare "FAIL" (later
+    // joined only to the routing block) leaves the operator nothing to act on.
+    // Substitute a concrete default on the raw details, BEFORE CAS routing, so
+    // the substitution is based on the semantic content (and an output-free
+    // failure never wastes a CAS upload on an empty body).
+    let raw_details = if outcome.status.is_failure() && outcome.details.trim().is_empty() {
+        NO_OUTPUT_FAILURE_DETAIL.to_owned()
+    } else {
+        outcome.details
+    };
+    let mut details = finalize_details(ctx, DetailKind::of(outcome.status), raw_details).await;
     if outcome.status.is_failure() {
         let annotation = failure_annotation(plan, ctx, &test_id);
         if !annotation.is_empty() {
@@ -1729,40 +1878,53 @@ async fn report_target_failure(
     status: TestVerdict,
     details: String,
 ) {
-    let name = format!("{} (listing)", plan.spec.suite);
+    report_target_failure_for_spec(
+        ctx,
+        &plan.spec,
+        plan.quarantined(),
+        plan.repeat,
+        status,
+        details,
+    )
+    .await;
+}
+
+/// Report a single target-level failure from the spec alone, without requiring a
+/// fully-derived [`TargetPlan`]. Used both by the plan-based
+/// [`report_target_failure`] and by [`run_target`] when no plan could be derived
+/// (e.g. an unregistered `test_type`), so an unrunnable target still surfaces as
+/// a reported, countable result instead of vanishing.
+async fn report_target_failure_for_spec(
+    ctx: &TargetCtx,
+    spec: &TargetSpec,
+    quarantined: bool,
+    repeat: RepeatKind,
+    status: TestVerdict,
+    details: String,
+) {
+    let name = format!("{} (listing)", spec.suite);
     if let Err(e) = ctx
         .orch
-        .report_tests_discovered(
-            plan.spec.handle_proto(),
-            plan.spec.suite.clone(),
-            vec![name.clone()],
-        )
+        .report_tests_discovered(spec.handle_proto(), spec.suite.clone(), vec![name.clone()])
         .await
     {
         eprintln!(
             "quokka: failed to report the failing-target listing for {}: {e:#}",
-            plan.spec.display
+            spec.display
         );
     }
     let details = finalize_details(ctx, DetailKind::of(status), details).await;
     let test_id = TestIdentity {
-        target: plan.spec.display.clone(),
-        name: plan.spec.display.clone(), // Target failures use the target name as the base test name.
+        target: spec.display.clone(),
+        name: spec.display.clone(), // Target failures use the target name as the base test name.
         variant: ctx.config.variant.clone(),
     };
     let run_id = RunIdentity {
         test: test_id.clone(),
-        repeat: plan.repeat,
+        repeat,
         repeat_index: 0,
     };
-    let result = build_test_result(
-        &run_id,
-        plan.spec.handle_proto(),
-        status,
-        None,
-        details,
-        None,
-    );
+    let result = build_test_result(&run_id, spec.handle_proto(), status, None, details, None);
     // A closed reporter channel means the reporter task died, which the run loop
     // detects and turns into a failing verdict; this drop cannot hide a failure.
     let _ = ctx
@@ -1771,7 +1933,7 @@ async fn report_target_failure(
             result,
             test_id,
             status,
-            quarantined: plan.quarantined(),
+            quarantined,
             // A listing/target-level failure is not a per-test duration sample.
             db_observations: Vec::new(),
         }]))
@@ -2089,6 +2251,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn panic_message_extracts_known_payloads() {
+        // catch_unwind yields a Box<dyn Any + Send>; panic payloads are
+        // conventionally &'static str or String. Anything else degrades to a
+        // generic message rather than risking a second panic while formatting.
+        let static_str: Box<dyn std::any::Any + Send> = Box::new("boom static");
+        assert_eq!(panic_message(&*static_str), "boom static");
+        let owned: Box<dyn std::any::Any + Send> = Box::new(String::from("boom owned"));
+        assert_eq!(panic_message(&*owned), "boom owned");
+        let other: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(panic_message(&*other), "unknown panic payload");
     }
 
     #[test]

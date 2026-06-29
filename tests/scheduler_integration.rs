@@ -69,6 +69,29 @@ struct MockBuck2 {
     /// Stderr emitted by normal Testing executions. Failed results must surface
     /// this stream alongside parsed harness details.
     testing_stderr: Option<&'static str>,
+    /// If true, every Testing execution returns an `ExecuteResponse2` with no
+    /// `response` oneof set — a protocol-violating message buck2 never emits.
+    /// The runner must fail closed (InfraFailure), not drop the test as a green
+    /// omission.
+    malformed_response: bool,
+    /// If true, a `failed` libtest event is emitted with no `stdout`/`message`,
+    /// simulating a failure the harness reported with no captured output. The
+    /// runner must still surface a concrete cause, not a bare routing block.
+    empty_failure_details: bool,
+}
+
+/// Per-test knobs for the mock buck2 orchestrator. Defaults to the happy path so
+/// each test sets only the one behavior it exercises.
+#[derive(Default)]
+struct MockOptions {
+    omit_in_batch: Option<String>,
+    flaky_once: Option<String>,
+    cache_replay: bool,
+    garbage_stdout: bool,
+    stderr_only_output: bool,
+    testing_stderr: Option<&'static str>,
+    malformed_response: bool,
+    empty_failure_details: bool,
 }
 
 fn command_verbatim_args(req: &ExecuteRequest2) -> Vec<String> {
@@ -282,6 +305,12 @@ impl TestOrchestrator for MockBuck2 {
                 rec.testing_calls.push(effective_testcases.clone());
                 rec.disable_caching_calls
                     .push(req.disable_test_execution_caching);
+                if self.malformed_response {
+                    // A response with no `response` oneof: buck2 never sends this,
+                    // so the runner must fail closed rather than read a pass.
+                    drop(rec);
+                    return Ok(Response::new(ExecuteResponse2 { response: None }));
+                }
                 if self.cache_replay {
                     // Cache hit: exit 0, no streams. The runner must read PASS
                     // from the exit status alone (buck2 returns empty stdout).
@@ -345,9 +374,15 @@ impl TestOrchestrator for MockBuck2 {
                         ));
                     } else if event == "failed" {
                         any_fail = true;
-                        out.push_str(&format!(
-                            "{{ \"type\": \"test\", \"name\": \"{name}\", \"event\": \"failed\", \"stdout\": \"boom\" }}\n"
-                        ));
+                        if self.empty_failure_details {
+                            out.push_str(&format!(
+                                "{{ \"type\": \"test\", \"name\": \"{name}\", \"event\": \"failed\" }}\n"
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "{{ \"type\": \"test\", \"name\": \"{name}\", \"event\": \"failed\", \"stdout\": \"boom\" }}\n"
+                            ));
+                        }
                     } else {
                         out.push_str(&format!(
                             "{{ \"type\": \"test\", \"name\": \"{name}\", \"event\": \"{event}\" }}\n"
@@ -500,7 +535,7 @@ async fn mock_orchestrator(
     Arc<Mutex<Recorded>>,
     tokio::task::JoinHandle<()>,
 ) {
-    mock_orchestrator_full(test_events, None, None, false, false, false, None).await
+    mock_orchestrator_full(test_events, MockOptions::default()).await
 }
 
 /// A mock that answers every Testing execution as a cache replay: exit 0 with
@@ -513,7 +548,14 @@ async fn mock_orchestrator_replay(
     Arc<Mutex<Recorded>>,
     tokio::task::JoinHandle<()>,
 ) {
-    mock_orchestrator_full(test_events, None, None, true, false, false, None).await
+    mock_orchestrator_full(
+        test_events,
+        MockOptions {
+            cache_replay: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// A mock whose fresh Testing executions emit non-JSON stdout with exit 0, so a
@@ -525,7 +567,14 @@ async fn mock_orchestrator_garbage(
     Arc<Mutex<Recorded>>,
     tokio::task::JoinHandle<()>,
 ) {
-    mock_orchestrator_full(test_events, None, None, false, true, false, None).await
+    mock_orchestrator_full(
+        test_events,
+        MockOptions {
+            garbage_stdout: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn mock_orchestrator_stderr_only(
@@ -535,17 +584,39 @@ async fn mock_orchestrator_stderr_only(
     Arc<Mutex<Recorded>>,
     tokio::task::JoinHandle<()>,
 ) {
-    mock_orchestrator_full(test_events, None, None, false, false, true, None).await
+    mock_orchestrator_full(
+        test_events,
+        MockOptions {
+            stderr_only_output: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// A mock whose Testing executions return a protocol-violating response (no
+/// `response` oneof), so the fail-closed handling of a malformed boundary
+/// message can be exercised end to end.
+async fn mock_orchestrator_malformed(
+    test_events: Vec<(String, &'static str)>,
+) -> (
+    Orchestrator,
+    Arc<Mutex<Recorded>>,
+    tokio::task::JoinHandle<()>,
+) {
+    mock_orchestrator_full(
+        test_events,
+        MockOptions {
+            malformed_response: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn mock_orchestrator_full(
     test_events: Vec<(String, &'static str)>,
-    omit_in_batch: Option<String>,
-    flaky_once: Option<String>,
-    cache_replay: bool,
-    garbage_stdout: bool,
-    stderr_only_output: bool,
-    testing_stderr: Option<&'static str>,
+    options: MockOptions,
 ) -> (
     Orchestrator,
     Arc<Mutex<Recorded>>,
@@ -554,6 +625,16 @@ async fn mock_orchestrator_full(
     let recorded = Arc::new(Mutex::new(Recorded::default()));
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
+    let MockOptions {
+        omit_in_batch,
+        flaky_once,
+        cache_replay,
+        garbage_stdout,
+        stderr_only_output,
+        testing_stderr,
+        malformed_response,
+        empty_failure_details,
+    } = options;
     let mock = MockBuck2 {
         test_events,
         recorded: recorded.clone(),
@@ -563,6 +644,8 @@ async fn mock_orchestrator_full(
         garbage_stdout,
         stderr_only_output,
         testing_stderr,
+        malformed_response,
+        empty_failure_details,
     };
     let router = tonic::transport::Server::builder().add_service(
         TestOrchestratorServer::new(mock)
@@ -624,15 +707,13 @@ async fn parsed_failure_reports_action_stderr() {
     let events = vec![("stderr_fails".to_string(), "failed")];
     let (orch, recorded, _server) = mock_orchestrator_full(
         events,
-        None,
-        None,
-        false,
-        false,
-        false,
-        Some(
-            "thread 'worker' panicked at src/failure.rs:9:5:\n\
-             action stderr sentinel from failed test",
-        ),
+        MockOptions {
+            testing_stderr: Some(
+                "thread 'worker' panicked at src/failure.rs:9:5:\n\
+                 action stderr sentinel from failed test",
+            ),
+            ..Default::default()
+        },
     )
     .await;
 
@@ -692,6 +773,170 @@ async fn stderr_only_fresh_run_is_not_a_silent_pass() {
         result.details
     );
     assert_ne!(rec.end_exit_code, Some(0), "the run must fail");
+}
+
+#[tokio::test]
+async fn malformed_execute_response_is_not_a_silent_pass() {
+    // buck2 always sets the ExecuteResponse2 `response` oneof; a message with
+    // none set is a protocol violation. The runner must fail closed with a
+    // countable InfraFailure (surfaced with details), not drop the test as a
+    // green omission.
+    let events = vec![("alpha".to_string(), "ok")];
+    let (orch, recorded, _server) = mock_orchestrator_malformed(events).await;
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    intake_tx
+        .send(SpecEnvelope::Spec(Box::new(libtest_spec(7))))
+        .unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, test_config(), test_context()).await;
+
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert_eq!(rec.results.len(), 1, "expected one result");
+    let result = &rec.results[0];
+    assert_eq!(
+        result.status,
+        TestStatus::InfraFailure as i32,
+        "a malformed response must be a countable infra failure, not an omission"
+    );
+    assert!(
+        result
+            .details
+            .contains("neither a result nor a cancellation"),
+        "the malformed-response cause must be surfaced; got: {:?}",
+        result.details
+    );
+    assert_ne!(rec.end_exit_code, Some(0), "the run must fail");
+}
+
+#[tokio::test]
+async fn failing_test_without_captured_output_still_explains_itself() {
+    // A test the harness reports FAILED but with no captured stdout/stderr must
+    // not surface as a bare "FAIL <name>" plus only the routing block — the
+    // operator gets no cause. The runner substitutes a concrete default cause.
+    let events = vec![("silent_fail".to_string(), "failed")];
+    let (orch, recorded, _server) = mock_orchestrator_full(
+        events,
+        MockOptions {
+            empty_failure_details: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    intake_tx
+        .send(SpecEnvelope::Spec(Box::new(libtest_spec(7))))
+        .unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, test_config(), test_context()).await;
+
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert_eq!(rec.results.len(), 1, "expected one failed result");
+    let result = &rec.results[0];
+    assert_eq!(result.status, TestStatus::Fail as i32);
+    assert!(
+        result.details.contains("no captured stdout/stderr"),
+        "an output-free failure must still carry a concrete cause; got: {:?}",
+        result.details
+    );
+    assert_ne!(rec.end_exit_code, Some(0), "the run must fail");
+}
+
+#[tokio::test]
+async fn unregistered_test_type_reports_a_fatal_not_a_silent_panic() {
+    // A target whose test_type has no registered translator cannot be run. It
+    // must surface as a reported FATAL naming the test_type (so the operator can
+    // fix the rule), not panic into an anonymous task-join error that fails the
+    // build with no attributable cause.
+    let (orch, recorded, _server) = mock_orchestrator(vec![]).await;
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut spec = libtest_spec(7);
+    spec.test_type = "totally_unknown_framework".to_string();
+    intake_tx.send(SpecEnvelope::Spec(Box::new(spec))).unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, test_config(), test_context()).await;
+
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert_eq!(
+        rec.results.len(),
+        1,
+        "the unrunnable target must be reported, not silently dropped"
+    );
+    let result = &rec.results[0];
+    assert_eq!(
+        result.status,
+        TestStatus::Fatal as i32,
+        "an unrunnable target is a FATAL result"
+    );
+    assert!(
+        result.details.contains("totally_unknown_framework"),
+        "details must name the unknown test_type; got: {:?}",
+        result.details
+    );
+    assert_ne!(rec.end_exit_code, Some(0), "an unrunnable target must fail");
+}
+
+#[tokio::test]
+async fn unregistered_test_type_fails_even_when_quarantined() {
+    // A target that cannot run at all is a structural failure, not the
+    // quarantined test flaking. A quarantine label must NOT suppress it into a
+    // green build — quarantine suppresses flaky test verdicts, not the runner's
+    // inability to produce any verdict.
+    let (orch, recorded, _server) = mock_orchestrator(vec![]).await;
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut spec = libtest_spec_labeled(7, vec!["quarantined".to_string()]);
+    spec.test_type = "totally_unknown_framework".to_string();
+    intake_tx.send(SpecEnvelope::Spec(Box::new(spec))).unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, test_config(), test_context()).await;
+
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert_eq!(
+        rec.results.len(),
+        1,
+        "the unrunnable target must be reported"
+    );
+    assert_eq!(rec.results[0].status, TestStatus::Fatal as i32);
+    assert_ne!(
+        rec.end_exit_code,
+        Some(0),
+        "a quarantined-but-unrunnable target must still fail the run, not pass green"
+    );
+}
+
+#[tokio::test]
+async fn malformed_spec_fails_the_run_rather_than_dropping_silently() {
+    // buck2 always populates target+handle; a spec missing them is a protocol
+    // violation. The target has no handle, so it cannot be reported as a
+    // TestResult — but the runner must still fail the run closed instead of
+    // dropping the whole target as a silent green pass.
+    let (orch, recorded, _server) = mock_orchestrator(vec![]).await;
+
+    let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut bad = libtest_spec(7);
+    bad.target = None;
+    intake_tx.send(SpecEnvelope::Spec(Box::new(bad))).unwrap();
+    intake_tx.send(SpecEnvelope::EndOfRequests).unwrap();
+
+    drive_to_completion(orch, intake_rx, test_config(), test_context()).await;
+
+    let rec = recorded.lock().expect("recorded mutex poisoned");
+    assert!(
+        rec.results.is_empty(),
+        "a handle-less spec cannot be reported as a per-test result"
+    );
+    assert_eq!(
+        rec.end_exit_code,
+        Some(32),
+        "a malformed spec must fail the run, not pass it green"
+    );
 }
 
 #[tokio::test]
@@ -906,12 +1151,10 @@ async fn batch_isolation_reruns_missing_member_singly() {
     let events = vec![("x".to_string(), "ok"), ("y".to_string(), "ok")];
     let (orch, recorded, _server) = mock_orchestrator_full(
         events,
-        Some("y".to_string()),
-        None,
-        false,
-        false,
-        false,
-        None,
+        MockOptions {
+            omit_in_batch: Some("y".to_string()),
+            ..Default::default()
+        },
     )
     .await;
     let mut config = test_config();
@@ -957,12 +1200,10 @@ async fn flaky_member_passes_on_retry_without_failing_siblings() {
     let events = vec![("p".to_string(), "ok"), ("f".to_string(), "ok")];
     let (orch, recorded, _server) = mock_orchestrator_full(
         events,
-        None,
-        Some("f".to_string()),
-        false,
-        false,
-        false,
-        None,
+        MockOptions {
+            flaky_once: Some("f".to_string()),
+            ..Default::default()
+        },
     )
     .await;
     let mut config = test_config();
@@ -1019,12 +1260,10 @@ async fn flake_db_records_each_fresh_attempt_not_just_the_folded_best() {
     let events = vec![("steady".to_string(), "ok"), ("flaky".to_string(), "ok")];
     let (orch, _recorded, _server) = mock_orchestrator_full(
         events,
-        None,
-        Some("flaky".to_string()),
-        false,
-        false,
-        false,
-        None,
+        MockOptions {
+            flaky_once: Some("flaky".to_string()),
+            ..Default::default()
+        },
     )
     .await;
     let mut config = test_config();
@@ -1219,12 +1458,10 @@ attempts = 3
     {
         let (orch, recorded, _server) = mock_orchestrator_full(
             events,
-            None,
-            Some("a".to_string()),
-            false,
-            false,
-            false,
-            None,
+            MockOptions {
+                flaky_once: Some("a".to_string()),
+                ..Default::default()
+            },
         )
         .await;
         let (intake_tx, intake_rx) = tokio::sync::mpsc::unbounded_channel();
