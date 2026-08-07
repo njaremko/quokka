@@ -80,6 +80,14 @@ struct TpxConfig {
     #[arg(long, default_value_t = 600)]
     listing_timeout: u64,
 
+    /// Remote Linux memory-cgroup unit: `logical-test` or `action`.
+    #[arg(long, default_value = "action")]
+    cgroup_granularity: String,
+
+    /// Exact `target|test|memory.max` overrides for singleton test actions.
+    #[arg(long = "cgroup-memory-max-override")]
+    cgroup_memory_max_overrides: Vec<String>,
+
     #[arg(long)]
     include_ignored: bool,
     #[arg(long = "ignored")]
@@ -145,6 +153,11 @@ struct TpxConfig {
     #[arg(long)]
     no_duration_db: bool,
 
+    /// Write one bounded, structured result for this runner session. Reporting
+    /// is observational and does not change the test verdict.
+    #[arg(long)]
+    ci_test_report_json: Option<PathBuf>,
+
     /// Captured logs larger than this many bytes are uploaded to CAS.
     #[arg(long, default_value_t = 65_536)]
     cas_inline_limit: usize,
@@ -152,6 +165,10 @@ struct TpxConfig {
     /// Maximum test actions quokka may keep in flight across all targets.
     #[arg(long, default_value_t = 2_000)]
     max_inflight_test_actions: usize,
+
+    /// Maximum listing actions quokka may keep in flight.
+    #[arg(long, default_value_t = 256)]
+    max_inflight_listings: usize,
 
     /// Maximum test actions quokka may keep in flight for one target. This is
     /// separate from `--batch-mode`: per-test batching still cannot use more
@@ -318,22 +335,7 @@ pub struct SchedulerLimits {
     pub max_report_queue: usize,
 }
 
-impl Default for SchedulerLimits {
-    fn default() -> Self {
-        Self {
-            max_inflight_listings: 256,
-            max_inflight_test_actions: 2_000,
-            max_inflight_per_target: 128,
-            max_report_queue: 1_024,
-        }
-    }
-}
-
 /// Duration database state after CLI parsing and binary-level defaulting.
-///
-/// `Auto` is the pre-main state for an omitted `--duration-db`: the binary may
-/// resolve it to a persistent path, while tests and direct library callers can
-/// leave it unresolved and run without duration metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurationDbConfig {
     Auto,
@@ -362,11 +364,25 @@ impl DurationDbConfig {
     }
 }
 
-/// Typed runner configuration after CLI parsing.
+impl Default for SchedulerLimits {
+    fn default() -> Self {
+        Self {
+            max_inflight_listings: 256,
+            max_inflight_test_actions: 2_000,
+            max_inflight_per_target: 128,
+            max_report_queue: 1_024,
+        }
+    }
+}
+
+/// Fully resolved, typed runner configuration.
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
     pub per_test_timeout: Duration,
     pub listing_timeout: Duration,
+    pub cgroup_granularity: crate::execution::CgroupGranularity,
+    pub cgroup_memory_max: crate::execution::CgroupMemoryMax,
+    pub cgroup_memory_max_overrides: Vec<crate::execution::CgroupMemoryMaxOverride>,
     pub ignored: IgnoredPolicy,
     pub list_format: ListFormat,
     pub run_format: RunFormat,
@@ -382,13 +398,26 @@ pub struct RunnerConfig {
     pub limits: SchedulerLimits,
     pub cas_inline_limit: usize,
     pub duration_db: DurationDbConfig,
+    pub ci_test_report_json: Option<PathBuf>,
     pub libtest_help_only: bool,
     pub libtest_usage_error: Option<String>,
     pub libtest_list_only: bool,
+    /// Libtest flags written directly after Buck's runner separator. These are
+    /// only forwarded to libtest/doctest targets, unlike `--test-arg`, which is
+    /// deliberately framework-agnostic.
+    pub direct_libtest_args: Vec<String>,
     pub extra_test_args: Vec<String>,
     pub extra_env: Vec<(String, String)>,
     pub declared_output_env: Vec<(String, String)>,
     pub quokka_config: crate::config::QuokkaConfig,
+}
+
+impl RunnerConfig {
+    pub fn effective_libtest_args(&self) -> Vec<String> {
+        let mut args = self.extra_test_args.clone();
+        args.extend(self.direct_libtest_args.iter().cloned());
+        args
+    }
 }
 
 /// Contextual metadata for the test session.
@@ -483,8 +512,10 @@ fn resolve_config(
     outer: &OuterCli,
     tpx: TpxConfig,
 ) -> Result<(RunnerConfig, SessionContext), CliError> {
-    let mut extra_test_args = tpx.test_arg.clone();
-    extra_test_args.extend(tpx.direct_libtest_args());
+    let extra_test_args = tpx.test_arg.clone();
+    let direct_libtest_args = tpx.direct_libtest_args();
+    let mut effective_libtest_args = extra_test_args.clone();
+    effective_libtest_args.extend(direct_libtest_args.iter().cloned());
 
     let mut ignored = IgnoredPolicy::ExcludeIgnored;
     let mut ignored_policies = Vec::new();
@@ -494,7 +525,7 @@ fn resolve_config(
     if tpx.ignored || tpx.ignored_only {
         ignored_policies.push(IgnoredPolicy::IgnoredOnly);
     }
-    ignored_policies.extend(libtest_user_ignored_policies(&extra_test_args));
+    ignored_policies.extend(libtest_user_ignored_policies(&effective_libtest_args));
     for policy in ignored_policies {
         if ignored == IgnoredPolicy::ExcludeIgnored {
             ignored = policy;
@@ -558,13 +589,6 @@ fn resolve_config(
             });
         }
     };
-
-    let variant = Variant::parse(&tpx.variant);
-    let stress = match NonZeroU32::new(tpx.stress) {
-        Some(n) => RepeatKind::Stress(n),
-        None => RepeatKind::Once,
-    };
-    let stress_label_reps = NonZeroU32::new(tpx.stress_label_reps).unwrap_or(NonZeroU32::MIN);
     let duration_db = if tpx.no_duration_db {
         if tpx.duration_db.is_some() {
             return Err(CliError::ConflictingDurationDbFlags);
@@ -576,6 +600,61 @@ fn resolve_config(
             None => DurationDbConfig::Auto,
         }
     };
+    let cgroup_granularity = match tpx.cgroup_granularity.as_str() {
+        "logical-test" => crate::execution::CgroupGranularity::LogicalTest,
+        "action" => crate::execution::CgroupGranularity::Action,
+        other => {
+            return Err(CliError::InvalidValue {
+                field: "cgroup-granularity",
+                value: other.to_owned(),
+            });
+        }
+    };
+    let cgroup_memory_max_raw = match std::env::var("NOBIE_RUST_TEST_CGROUP_MEMORY_MAX_BYTES") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => {
+            crate::execution::DEFAULT_CGROUP_MEMORY_MAX_BYTES.to_string()
+        }
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(CliError::InvalidValue {
+                field: "NOBIE_RUST_TEST_CGROUP_MEMORY_MAX_BYTES",
+                value: value.to_string_lossy().into_owned(),
+            });
+        }
+    };
+    let cgroup_memory_max = crate::execution::CgroupMemoryMax::parse(&cgroup_memory_max_raw)
+        .ok_or_else(|| CliError::InvalidValue {
+            field: "NOBIE_RUST_TEST_CGROUP_MEMORY_MAX_BYTES",
+            value: cgroup_memory_max_raw.clone(),
+        })?;
+    let mut cgroup_memory_max_overrides = Vec::with_capacity(tpx.cgroup_memory_max_overrides.len());
+    for raw_override in &tpx.cgroup_memory_max_overrides {
+        let parsed =
+            crate::execution::CgroupMemoryMaxOverride::parse(raw_override).ok_or_else(|| {
+                CliError::InvalidValue {
+                    field: "cgroup-memory-max-override",
+                    value: raw_override.clone(),
+                }
+            })?;
+        if cgroup_memory_max_overrides.iter().any(
+            |existing: &crate::execution::CgroupMemoryMaxOverride| {
+                existing.target == parsed.target && existing.test == parsed.test
+            },
+        ) {
+            return Err(CliError::InvalidValue {
+                field: "cgroup-memory-max-override",
+                value: raw_override.clone(),
+            });
+        }
+        cgroup_memory_max_overrides.push(parsed);
+    }
+
+    let variant = Variant::parse(&tpx.variant);
+    let stress = match NonZeroU32::new(tpx.stress) {
+        Some(n) => RepeatKind::Stress(n),
+        None => RepeatKind::Once,
+    };
+    let stress_label_reps = NonZeroU32::new(tpx.stress_label_reps).unwrap_or(NonZeroU32::MIN);
 
     let shard = ShardSpec {
         index: tpx.shard_index,
@@ -614,6 +693,9 @@ fn resolve_config(
     let config = RunnerConfig {
         per_test_timeout: Duration::from_secs(tpx.timeout),
         listing_timeout: Duration::from_secs(tpx.listing_timeout),
+        cgroup_granularity,
+        cgroup_memory_max,
+        cgroup_memory_max_overrides,
         ignored,
         list_format,
         run_format,
@@ -626,15 +708,18 @@ fn resolve_config(
         local_debug: tpx.local_debug,
         flaky_attempts: tpx.flaky_attempts.max(1),
         limits: SchedulerLimits {
+            max_inflight_listings: tpx.max_inflight_listings.max(1),
             max_inflight_test_actions: tpx.max_inflight_test_actions.max(1),
             max_inflight_per_target: tpx.max_inflight_per_target.max(1),
             ..SchedulerLimits::default()
         },
         cas_inline_limit: tpx.cas_inline_limit,
         duration_db,
-        libtest_help_only: libtest_user_requests_help(&extra_test_args),
-        libtest_usage_error: libtest_user_usage_error(&extra_test_args),
-        libtest_list_only: libtest_user_requests_listing_only(&extra_test_args),
+        ci_test_report_json: tpx.ci_test_report_json,
+        libtest_help_only: libtest_user_requests_help(&effective_libtest_args),
+        libtest_usage_error: libtest_user_usage_error(&effective_libtest_args),
+        libtest_list_only: libtest_user_requests_listing_only(&effective_libtest_args),
+        direct_libtest_args,
         extra_test_args,
         extra_env,
         declared_output_env,
@@ -692,6 +777,10 @@ mod tests {
         assert_eq!(inv.context.host_platform.as_deref(), Some("linux"));
         // Defaults.
         assert_eq!(inv.config.per_test_timeout, Duration::from_secs(600));
+        assert_eq!(
+            inv.config.cgroup_granularity,
+            crate::execution::CgroupGranularity::Action
+        );
         assert_eq!(inv.config.ignored, IgnoredPolicy::ExcludeIgnored);
         assert_eq!(inv.config.run_format, RunFormat::Json);
         // Default batching chunks tests to amortize per-action overhead.
@@ -702,9 +791,9 @@ mod tests {
             }
         );
         // Scheduler concurrency limits fall back to their defaults.
+        assert_eq!(inv.config.limits.max_inflight_listings, 256);
         assert_eq!(inv.config.limits.max_inflight_test_actions, 2_000);
         assert_eq!(inv.config.limits.max_inflight_per_target, 128);
-        assert_eq!(inv.config.duration_db, DurationDbConfig::Auto);
     }
 
     #[test]
@@ -719,14 +808,23 @@ mod tests {
             "ignored",
             "--max-inflight-test-actions",
             "50",
+            "--max-inflight-listings",
+            "30720",
             "--max-inflight-per-target",
             "0",
+            "--cgroup-granularity",
+            "action",
         ]))
         .unwrap();
+        assert_eq!(inv.config.limits.max_inflight_listings, 30_720);
         assert_eq!(inv.config.limits.max_inflight_test_actions, 50);
         // Zero would deadlock the scheduler (a semaphore with no permits), so it
         // is clamped up to one.
         assert_eq!(inv.config.limits.max_inflight_per_target, 1);
+        assert_eq!(
+            inv.config.cgroup_granularity,
+            crate::execution::CgroupGranularity::Action
+        );
     }
 
     #[test]
@@ -873,7 +971,7 @@ mod tests {
         .unwrap();
         assert_eq!(inv.config.ignored, IgnoredPolicy::IgnoredOnly);
         assert_eq!(
-            inv.config.extra_test_args,
+            inv.config.direct_libtest_args,
             vec![
                 "alpha".to_owned(),
                 "--exact".to_owned(),
@@ -882,6 +980,7 @@ mod tests {
                 "--no-capture".to_owned()
             ]
         );
+        assert!(inv.config.extra_test_args.is_empty());
     }
 
     #[test]
@@ -991,11 +1090,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             inv.config.extra_test_args,
-            vec![
-                "editor::formula_bar_f2_existing_reference_edges".to_owned(),
-                "--exact".to_owned(),
-                "--no-capture".to_owned()
-            ]
+            vec!["editor::formula_bar_f2_existing_reference_edges".to_owned()]
+        );
+        assert_eq!(
+            inv.config.direct_libtest_args,
+            vec!["--exact".to_owned(), "--no-capture".to_owned()]
         );
     }
 
@@ -1094,6 +1193,26 @@ mod tests {
     fn missing_transport_errors() {
         let err = parse(argv(&["runner", "--", "ignored"])).unwrap_err();
         assert!(matches!(err, CliError::MissingTransport));
+    }
+
+    #[test]
+    fn ci_test_report_path_is_explicit() {
+        let inv = parse(argv(&[
+            "runner",
+            "--executor-fd",
+            "1",
+            "--orchestrator-fd",
+            "2",
+            "--",
+            "ignored",
+            "--ci-test-report-json",
+            ".tmp/quokka-results.json",
+        ]))
+        .unwrap();
+        assert_eq!(
+            inv.config.ci_test_report_json,
+            Some(PathBuf::from(".tmp/quokka-results.json"))
+        );
     }
 
     #[test]

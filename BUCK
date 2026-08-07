@@ -24,10 +24,12 @@ THIRD_PARTY = [
 ]
 
 _LIB_SRCS = glob(["src/**/*.rs"])
+_RESOURCE_SRCS = ["src/resource_supervisor.sh"]
 
 rust_library(
     name = "quokka-lib",
-    srcs = _LIB_SRCS,
+    srcs = _LIB_SRCS + _RESOURCE_SRCS,
+    resources = ["src/resource_supervisor.sh"],
     crate = "quokka",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -50,7 +52,8 @@ load("//rules:cached_rust_test.bzl", "cached_rust_test")
 # Unit tests live inside the library modules; compile the crate with `--test`.
 cached_rust_test(
     name = "quokka-lib-test",
-    srcs = _LIB_SRCS,
+    srcs = _LIB_SRCS + _RESOURCE_SRCS,
+    resources = ["src/resource_supervisor.sh"],
     crate = "quokka",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -67,5 +70,13 @@ cached_rust_test(
     visibility = ["PUBLIC"],
 )
 
-
+cached_rust_test(
+    name = "resource_supervisor_watchdog_test",
+    srcs = ["tests/resource_supervisor_watchdog_test.rs"] + _RESOURCE_SRCS,
+    resources = ["src/resource_supervisor.sh"],
+    crate_root = "tests/resource_supervisor_watchdog_test.rs",
+    edition = "2024",
+    deps = [":quokka-lib"] + THIRD_PARTY,
+    visibility = ["PUBLIC"],
+)
 

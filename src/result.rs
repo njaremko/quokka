@@ -19,48 +19,29 @@ use crate::proto::test::{
 use crate::variant::{RepeatKind, Variant};
 
 /// What buck2 returned for one `Execute2`: a completed action, a cancellation
-/// whose two reasons mean very different things (see [`crate::scheduler`]), or a
-/// message we cannot interpret at all.
+/// whose two reasons mean very different things, or an uninterpretable message
+/// that must fail closed (see [`crate::scheduler`]).
 #[derive(Debug)]
 pub enum Execute2Outcome {
     Completed(CompletedAction),
     /// `RE_QUEUE_TIMEOUT`: transient infra; eligible for a bounded retry.
     CancelledQueueTimeout,
-    /// `NOT_SPECIFIED` or absent reason: genuine global/deadline cancel (buck2
-    /// tears a run down with no specific reason); never retried, never a test
-    /// failure.
+    /// `NOT_SPECIFIED` or absent reason: global/deadline cancel; never retried.
     CancelledUnspecified,
-    /// buck2 sent a response that violates the protocol (see
-    /// [`MalformedResponse`]). Fail closed: a corrupt boundary message must
-    /// never read as a passing or omitted test.
+    /// buck2 sent a response that violates the response protocol.
     Malformed(MalformedResponse),
 }
 
-/// A response whose top-level *kind* buck2 should never send under the protocol
-/// it shares with this runner. Carried by [`Execute2Outcome::Malformed`] so the
-/// scheduler can fail the run closed with an actionable message instead of
-/// silently omitting the test — an omitted test is counted as a non-failure and
-/// reads as a green build.
-///
-/// Scoped to the `response` oneof. An unknown *detail* within a known kind (e.g.
-/// an unrecognized cancellation reason inside a `Cancelled`) is NOT malformed:
-/// the kind already carries its meaning, so it is interpreted as that kind (see
-/// [`decode_response`]). Only an absent/unknown kind is uninterpretable.
+/// A response whose top-level kind buck2 should always set but did not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MalformedResponse {
-    /// `ExecuteResponse2` carried neither a result nor a cancellation. buck2
-    /// always sets the `response` oneof, so an absent oneof is an unknown
-    /// response *kind* — corruption, or a response variant from a newer buck2.
-    /// Either way it is uninterpretable, so fail closed.
     NoResponseField,
 }
 
 impl MalformedResponse {
-    /// Operator-facing explanation, surfaced as the failure details so a
-    /// malformed boundary message is visible in buck2's terminal output.
     pub fn detail(self) -> String {
         match self {
-            MalformedResponse::NoResponseField => {
+            Self::NoResponseField => {
                 "buck2 returned an Execute2 response with neither a result nor a cancellation"
                     .to_owned()
             }
@@ -175,24 +156,20 @@ pub fn decode_response(response: ExecuteResponse2) -> Execute2Outcome {
         Some(execute_response2::Response::Result(result)) => {
             Execute2Outcome::Completed(decode_result(result))
         }
-        Some(execute_response2::Response::Cancelled(cancelled)) => match cancelled.reason {
-            // An absent reason is a genuine global/deadline cancel: buck2 emits
-            // `Cancelled { reason: None }` for a run torn down with no specific
-            // reason. Never retried, never a test failure.
-            None => Execute2Outcome::CancelledUnspecified,
-            Some(reason) => match CancellationReason::try_from(reason) {
-                Ok(CancellationReason::ReQueueTimeout) => Execute2Outcome::CancelledQueueTimeout,
-                // NOT_SPECIFIED, or any reason a newer buck2 added that this
-                // runner does not recognize: still a genuine cancellation, never
-                // a failure — exactly as buck2's own decoder treats an unknown
-                // reason (it collapses it to "unspecified"). Failing closed here
-                // would turn a future legitimate cancel reason into a red build.
+        Some(execute_response2::Response::Cancelled(cancelled)) => {
+            match cancelled
+                .reason
+                .and_then(|r| CancellationReason::try_from(r).ok())
+            {
+                Some(CancellationReason::ReQueueTimeout) => Execute2Outcome::CancelledQueueTimeout,
+                // NOT_SPECIFIED or an absent/unknown reason: treat as a global
+                // cancel; never retried.
                 _ => Execute2Outcome::CancelledUnspecified,
-            },
-        },
-        // buck2 always sets the `response` oneof (it constructs Result or
-        // Cancelled explicitly), so an absent oneof is a malformed message. Fail
-        // closed: a corrupt boundary message must never read as a pass.
+            }
+        }
+        // buck2 always sets the response oneof. An absent one is an
+        // uninterpretable boundary message, so fail closed rather than reading
+        // it as an omitted test.
         None => Execute2Outcome::Malformed(MalformedResponse::NoResponseField),
     }
 }
@@ -297,18 +274,6 @@ pub struct TestIdentity {
     pub variant: Variant,
 }
 
-impl TestIdentity {
-    pub(crate) fn to_db_key(&self) -> String {
-        let proj = project_dir_key();
-        let mut key = format!("{}\u{2}{}\u{1}{}", proj, self.target, self.name);
-        if let Some(v) = self.variant.identity() {
-            key.push('#');
-            key.push_str(&v);
-        }
-        key
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RunIdentity {
     pub test: TestIdentity,
@@ -388,29 +353,6 @@ mod tests {
     use std::num::NonZeroU32;
 
     #[test]
-    fn test_to_db_key_contains_project_dir_and_separator() {
-        let base_id = TestIdentity {
-            target: "m".into(),
-            name: "t".into(),
-            variant: Variant::Default,
-        };
-        let key = base_id.to_db_key();
-        let proj = project_dir_key();
-        assert!(
-            !proj.is_empty(),
-            "Project directory key should not be empty"
-        );
-        assert!(
-            key.starts_with(proj),
-            "Key should start with project directory"
-        );
-        assert!(key.contains('\u{2}'), "Key should contain the separator u2");
-        assert!(key.contains('\u{1}'), "Key should contain the separator u1");
-        let expected = format!("{}\u{2}m\u{1}t", proj);
-        assert_eq!(key, expected);
-    }
-
-    #[test]
     fn result_identity_is_unique_across_axes() {
         let base_id = TestIdentity {
             target: "m".into(),
@@ -469,54 +411,49 @@ mod tests {
         assert!(!TestVerdict::Omitted.is_failure());
     }
 
-    fn cancelled(reason: Option<i32>) -> ExecuteResponse2 {
-        ExecuteResponse2 {
-            response: Some(execute_response2::Response::Cancelled(
-                crate::proto::test::Cancelled { reason },
-            )),
-        }
-    }
-
     #[test]
     fn cancelled_reason_classification() {
-        // RE_QUEUE_TIMEOUT is the only retriable infra cancellation.
+        let queue = ExecuteResponse2 {
+            response: Some(execute_response2::Response::Cancelled(
+                crate::proto::test::Cancelled {
+                    reason: Some(CancellationReason::ReQueueTimeout as i32),
+                },
+            )),
+        };
         assert!(matches!(
-            decode_response(cancelled(Some(CancellationReason::ReQueueTimeout as i32))),
+            decode_response(queue),
             Execute2Outcome::CancelledQueueTimeout
         ));
 
-        // A genuine global cancel is reported either with no reason or with the
-        // explicit NOT_SPECIFIED reason; both are non-failing omissions.
+        let none = ExecuteResponse2 {
+            response: Some(execute_response2::Response::Cancelled(
+                crate::proto::test::Cancelled { reason: None },
+            )),
+        };
         assert!(matches!(
-            decode_response(cancelled(None)),
-            Execute2Outcome::CancelledUnspecified
-        ));
-        assert!(matches!(
-            decode_response(cancelled(Some(CancellationReason::NotSpecified as i32))),
+            decode_response(none),
             Execute2Outcome::CancelledUnspecified
         ));
     }
 
     #[test]
     fn absent_response_kind_fails_closed() {
-        // A response with no `response` oneof is an unknown *kind*: buck2 always
-        // sets it. It is uninterpretable, so it must fail closed, not read as an
-        // omitted (passing) test.
-        let no_oneof = ExecuteResponse2 { response: None };
+        let response = ExecuteResponse2 { response: None };
         assert!(matches!(
-            decode_response(no_oneof),
+            decode_response(response),
             Execute2Outcome::Malformed(MalformedResponse::NoResponseField)
         ));
     }
 
     #[test]
     fn unknown_cancellation_reason_is_a_plain_cancel_not_a_failure() {
-        // A `Cancelled` carrying a reason this runner does not recognize (e.g. a
-        // newer buck2 added one) is still a cancellation — a non-failing
-        // omission — matching buck2's own decoder. Failing closed here would turn
-        // a future legitimate cancel reason into a fleet-wide red build.
+        let response = ExecuteResponse2 {
+            response: Some(execute_response2::Response::Cancelled(
+                crate::proto::test::Cancelled { reason: Some(99) },
+            )),
+        };
         assert!(matches!(
-            decode_response(cancelled(Some(99))),
+            decode_response(response),
             Execute2Outcome::CancelledUnspecified
         ));
     }

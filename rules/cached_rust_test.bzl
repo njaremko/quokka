@@ -25,7 +25,6 @@ def _cached_rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
             supports_test_execution_caching = True,  # <-- Enable Caching
             local_resources = getattr(test_info, "local_resources", None),
             required_local_resources = getattr(test_info, "required_local_resources", None),
-            network_access = getattr(test_info, "network_access", None),
             worker = getattr(test_info, "worker", None),
         )
         for p in providers:

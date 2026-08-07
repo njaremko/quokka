@@ -23,7 +23,6 @@ By integrating with Buck2's external test runner protocol, `quokka` controls whe
 ### Controlling Caching with Labels
 You can disable caching for a specific test target by adding non-hermetic or unstable labels to it in your `BUCK` file. Caching is disabled if a label matches or ends with any of the following (separated by `:`):
 * `cache_disabled`
-* `flaky` (e.g., `rust:flaky`)
 * `uses_network`
 * `uses_wall_clock`
 * `uses_randomness_without_seed`
@@ -43,7 +42,7 @@ attempts = 3
 During retry attempts, caching is bypassed to guarantee fresh execution results.
 
 ### Unseen Test Cache-Busting
-When `quokka` encounters a test case not previously seen in its local database, it bypasses caching (`disable_test_execution_caching = true`) for the initial run. This ensures the runner gathers a baseline duration to populate the performance tracking database. Subsequent runs of the same binary are allowed to hit the cache (assuming they pass and have no flake or non-hermetic labels).
+When `quokka` encounters a test case not previously seen in its local database, it bypasses caching (`disable_test_execution_caching = true`) for the initial run. This ensures the runner gathers a baseline duration to populate the performance tracking database. Subsequent initial attempts of the same binary are allowed to hit the cache when the target has no non-hermetic labels. Retries after a non-pass always bypass caching.
 
 ### Enabling Caching for Rust Tests
 
@@ -79,7 +78,6 @@ def _cached_rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
             supports_test_execution_caching = True,  # <-- Enable Caching
             local_resources = getattr(test_info, "local_resources", None),
             required_local_resources = getattr(test_info, "required_local_resources", None),
-            network_access = getattr(test_info, "network_access", None),
             worker = getattr(test_info, "worker", None),
         )
         for p in providers:

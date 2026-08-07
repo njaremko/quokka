@@ -20,12 +20,18 @@ pub enum CommandArg {
 }
 
 impl CommandArg {
-    pub fn from_proto(v: ExternalRunnerSpecValue) -> Self {
-        match v.value.unwrap() {
+    fn from_proto(
+        v: ExternalRunnerSpecValue,
+        location: impl Into<String>,
+    ) -> Result<Self, SpecError> {
+        let value = v.value.ok_or_else(|| SpecError::MissingValue {
+            location: location.into(),
+        })?;
+        Ok(match value {
             Value::Verbatim(s) => CommandArg::Verbatim(s),
             Value::ArgHandle(i) => CommandArg::ArgHandle(i),
             Value::EnvHandle(s) => CommandArg::EnvHandle(s),
-        }
+        })
     }
 }
 
@@ -61,6 +67,8 @@ pub enum SpecError {
     MissingTarget,
     #[error("ExternalRunnerSpec target missing handle")]
     MissingHandle,
+    #[error("ExternalRunnerSpec {location} missing value")]
+    MissingValue { location: String },
 }
 
 impl TargetSpec {
@@ -81,15 +89,23 @@ impl TargetSpec {
         let mut env: Vec<(String, CommandArg)> = spec
             .env
             .into_iter()
-            .map(|(k, v)| (k, CommandArg::from_proto(v)))
-            .collect();
+            .map(|(key, value)| {
+                Ok((
+                    key.clone(),
+                    CommandArg::from_proto(value, format!("environment variable `{key}`"))?,
+                ))
+            })
+            .collect::<Result<_, SpecError>>()?;
         env.sort_by(|a, b| a.0.cmp(&b.0));
 
         let command = spec
             .command
             .into_iter()
-            .map(CommandArg::from_proto)
-            .collect::<Vec<_>>()
+            .enumerate()
+            .map(|(index, value)| {
+                CommandArg::from_proto(value, format!("command argument {index}"))
+            })
+            .collect::<Result<Vec<_>, SpecError>>()?
             .into_boxed_slice();
 
         Ok(Arc::new(TargetSpec {
@@ -205,6 +221,51 @@ mod tests {
         assert!(matches!(
             TargetSpec::from_proto(spec),
             Err(SpecError::MissingTarget)
+        ));
+    }
+
+    fn minimal_spec() -> ExternalRunnerSpec {
+        ExternalRunnerSpec {
+            target: Some(ConfiguredTarget {
+                handle: Some(ConfiguredTargetHandle { id: 7 }),
+                cell: "root".into(),
+                package: "p".into(),
+                target: "t".into(),
+                configuration: String::new(),
+                package_project_relative_path: "p".into(),
+                test_config_unification_rollout: false,
+                package_oncall: None,
+            }),
+            test_type: "rust".into(),
+            command: vec![verbatim("./t")],
+            env: HashMap::new(),
+            labels: vec![],
+            contacts: vec![],
+            oncall: None,
+            working_dir_cell: "root".into(),
+        }
+    }
+
+    #[test]
+    fn missing_command_value_is_a_precise_error() {
+        let mut spec = minimal_spec();
+        spec.command.push(ExternalRunnerSpecValue { value: None });
+        assert!(matches!(
+            TargetSpec::from_proto(spec),
+            Err(SpecError::MissingValue { location })
+                if location == "command argument 1"
+        ));
+    }
+
+    #[test]
+    fn missing_environment_value_is_a_precise_error() {
+        let mut spec = minimal_spec();
+        spec.env
+            .insert("BROKEN".to_owned(), ExternalRunnerSpecValue { value: None });
+        assert!(matches!(
+            TargetSpec::from_proto(spec),
+            Err(SpecError::MissingValue { location })
+                if location == "environment variable `BROKEN`"
         ));
     }
 }

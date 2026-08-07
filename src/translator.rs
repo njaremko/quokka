@@ -9,6 +9,7 @@
 
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
+use std::time::Duration;
 
 use crate::listing::{
     IgnoredPolicy, ListingParseError, TestCase, TestCaseKind, TestCaseLocation, TestCaseMetadata,
@@ -69,11 +70,13 @@ impl TranslatorRegistry {
             Box::new(LibtestTranslator {
                 list_format: config.list_format,
                 run_format: config.run_format,
+                direct_user_args: config.direct_libtest_args.clone(),
             })
         });
         reg.register("rust_doctest_v1", |config| {
             Box::new(DoctestTranslator {
                 run_format: config.run_format,
+                direct_user_args: config.direct_libtest_args.clone(),
             })
         });
         reg.register("custom_test_v1", |_| Box::new(CustomBinaryTranslator));
@@ -423,6 +426,7 @@ pub enum RunFormat {
 pub struct PerTestObservation {
     pub status: TestVerdict,
     pub details: String,
+    pub framework_case_duration: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -780,6 +784,12 @@ struct RunEvent {
     stdout: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    exec_time: Option<f64>,
+}
+
+fn nonnegative_duration(seconds: Option<f64>) -> Option<Duration> {
+    seconds.and_then(|value| Duration::try_from_secs_f64(value).ok())
 }
 
 /// Parse libtest `--format json` run output: one object per line, keeping
@@ -801,6 +811,7 @@ fn decode_json(stdout: &str) -> FxHashMap<String, PerTestObservation> {
                     PerTestObservation {
                         status: TestVerdict::Pass,
                         details: String::new(),
+                        framework_case_duration: None,
                     },
                 );
             }
@@ -821,22 +832,23 @@ fn decode_json(stdout: &str) -> FxHashMap<String, PerTestObservation> {
             _ => TestVerdict::Fatal,
         };
         let details = json_failure_details(event.stdout, event.message);
-        out.insert(name, PerTestObservation { status, details });
+        out.insert(
+            name,
+            PerTestObservation {
+                status,
+                details,
+                framework_case_duration: nonnegative_duration(event.exec_time),
+            },
+        );
     }
     out
 }
 
 fn json_failure_details(stdout: Option<String>, message: Option<String>) -> String {
     match (stdout, message) {
-        (Some(stdout), Some(message)) => {
-            if stdout.is_empty() {
-                message
-            } else if message.is_empty() || stdout == message {
-                stdout
-            } else {
-                format!("{stdout}\n{message}")
-            }
-        }
+        (Some(stdout), Some(message)) if stdout.is_empty() => message,
+        (Some(stdout), Some(message)) if message.is_empty() || stdout == message => stdout,
+        (Some(stdout), Some(message)) => format!("{stdout}\n{message}"),
         (Some(stdout), None) => stdout,
         (None, Some(message)) => message,
         (None, None) => String::new(),
@@ -876,7 +888,21 @@ fn decode_text(stdout: &str, stderr: &str) -> FxHashMap<String, PerTestObservati
         } else {
             String::new()
         };
-        out.insert(name.to_owned(), PerTestObservation { status, details });
+        let framework_case_duration = status_token
+            .split_whitespace()
+            .last()
+            .and_then(|token| token.strip_prefix('<'))
+            .and_then(|token| token.strip_suffix("s>"))
+            .and_then(|seconds| seconds.parse::<f64>().ok())
+            .and_then(|seconds| nonnegative_duration(Some(seconds)));
+        out.insert(
+            name.to_owned(),
+            PerTestObservation {
+                status,
+                details,
+                framework_case_duration,
+            },
+        );
     }
     out
 }
@@ -899,6 +925,7 @@ fn extract_failure_block(stdout: &str, name: &str) -> Option<String> {
 pub struct LibtestTranslator {
     list_format: ListFormat,
     run_format: RunFormat,
+    direct_user_args: Vec<String>,
 }
 
 impl Translator for LibtestTranslator {
@@ -910,9 +937,12 @@ impl Translator for LibtestTranslator {
     }
     fn listing_strategy(&self) -> ListingStrategy {
         let list_format = self.list_format;
+        let direct_user_args = self.direct_user_args.clone();
         ListingStrategy::PerTestListing {
             request_args: Box::new(move |ignored, user_args| {
-                libtest_listing_args(ignored, list_format, user_args)
+                let mut libtest_args = user_args.to_vec();
+                libtest_args.extend(direct_user_args.iter().cloned());
+                libtest_listing_args(ignored, list_format, &libtest_args)
             }),
             parse: Box::new(move |stdout, ignored| parse_listing(list_format, stdout, ignored)),
         }
@@ -923,7 +953,9 @@ impl Translator for LibtestTranslator {
         ignored: IgnoredPolicy,
         user_args: &[String],
     ) -> Vec<String> {
-        libtest_execution_args(names, ignored, self.run_format, user_args)
+        let mut libtest_args = user_args.to_vec();
+        libtest_args.extend(self.direct_user_args.iter().cloned());
+        libtest_execution_args(names, ignored, self.run_format, &libtest_args)
     }
     fn parse_results(&self, stdout: &[u8], stderr: &[u8]) -> FxHashMap<String, PerTestObservation> {
         libtest_decode(self.run_format, stdout, stderr)
@@ -932,6 +964,7 @@ impl Translator for LibtestTranslator {
 
 pub struct DoctestTranslator {
     run_format: RunFormat,
+    direct_user_args: Vec<String>,
 }
 
 impl Translator for DoctestTranslator {
@@ -952,7 +985,9 @@ impl Translator for DoctestTranslator {
         ignored: IgnoredPolicy,
         user_args: &[String],
     ) -> Vec<String> {
-        doctest_execution_args(ignored, self.run_format, user_args)
+        let mut libtest_args = user_args.to_vec();
+        libtest_args.extend(self.direct_user_args.iter().cloned());
+        doctest_execution_args(ignored, self.run_format, &libtest_args)
     }
     fn parse_results(&self, stdout: &[u8], stderr: &[u8]) -> FxHashMap<String, PerTestObservation> {
         libtest_decode(self.run_format, stdout, stderr)
@@ -1218,18 +1253,41 @@ mod tests {
             observations.get("bench_five"),
             Some(&PerTestObservation {
                 status: TestVerdict::Pass,
-                details: String::new()
+                details: String::new(),
+                framework_case_duration: None,
             })
         );
     }
 
     #[test]
-    fn json_failed_event_preserves_stdout_and_message() {
-        let output = r#"{ "type": "test", "event": "failed", "name": "alpha", "stdout": "captured stdout", "message": "panic message" }"#;
+    fn json_report_time_is_a_framework_case_duration() {
+        let output =
+            r#"{ "type": "test", "name": "alpha_one", "event": "ok", "exec_time": 0.125 }"#;
         let observations = libtest_decode(RunFormat::Json, output.as_bytes(), b"");
-        let details = &observations.get("alpha").expect("alpha result").details;
-        assert!(details.contains("captured stdout"), "got: {details:?}");
-        assert!(details.contains("panic message"), "got: {details:?}");
+        assert_eq!(
+            observations.get("alpha_one"),
+            Some(&PerTestObservation {
+                status: TestVerdict::Pass,
+                details: String::new(),
+                framework_case_duration: Some(Duration::from_millis(125)),
+            })
+        );
+    }
+
+    #[test]
+    fn json_failures_keep_stdout_and_message_and_reject_invalid_time() {
+        let output = r#"{ "type": "test", "name": "alpha_one", "event": "failed", "stdout": "panic output", "message": "assertion failed", "exec_time": -1.0 }"#;
+        let observations = libtest_decode(RunFormat::Json, output.as_bytes(), b"");
+        assert_eq!(
+            observations.get("alpha_one"),
+            Some(&PerTestObservation {
+                status: TestVerdict::Fail,
+                details: "panic output\nassertion failed".to_owned(),
+                framework_case_duration: None,
+            })
+        );
+        assert!(nonnegative_duration(Some(f64::NAN)).is_none());
+        assert!(nonnegative_duration(Some(f64::INFINITY)).is_none());
     }
 
     #[test]
@@ -1246,15 +1304,58 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 1 measured; 0 filtered out; fini
             observations.get("alpha_one"),
             Some(&PerTestObservation {
                 status: TestVerdict::Pass,
-                details: String::new()
+                details: String::new(),
+                framework_case_duration: Some(Duration::from_millis(1)),
             })
         );
         assert_eq!(
             observations.get("bench_five"),
             Some(&PerTestObservation {
                 status: TestVerdict::Pass,
-                details: String::new()
+                details: String::new(),
+                framework_case_duration: None,
             })
+        );
+    }
+
+    #[test]
+    fn direct_libtest_flags_do_not_reach_custom_binaries() {
+        let config = crate::cli::parse(
+            [
+                "runner",
+                "--executor-fd",
+                "1",
+                "--orchestrator-fd",
+                "2",
+                "--",
+                "ignored",
+                "--test-arg",
+                "shared",
+                "--report-time",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap()
+        .config;
+        let registry = TranslatorRegistry::new();
+
+        let libtest = registry.resolve("rust", &config).unwrap();
+        assert!(
+            libtest
+                .execution_args(
+                    &["alpha"],
+                    IgnoredPolicy::ExcludeIgnored,
+                    &config.extra_test_args
+                )
+                .contains(&"--report-time".to_owned())
+        );
+
+        let custom = registry.resolve("custom_test_v1", &config).unwrap();
+        assert_eq!(
+            custom.execution_args(&[], IgnoredPolicy::ExcludeIgnored, &config.extra_test_args),
+            vec!["shared".to_owned()]
         );
     }
 }

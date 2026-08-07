@@ -248,10 +248,16 @@ fn run_list(
     }
 
     let mut out = std::io::BufWriter::new(std::io::stdout());
+    let handle_err = |error: std::io::Error| -> Result<(), Box<dyn std::error::Error>> {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            Ok(())
+        } else {
+            Err(error.into())
+        }
+    };
 
     if format == "json" {
         let json_str = serde_json::to_string_pretty(&rows)?;
-        use std::io::Write;
         if let Err(e) = writeln!(out, "{}", json_str) {
             if e.kind() == std::io::ErrorKind::BrokenPipe {
                 return Ok(());
@@ -260,9 +266,12 @@ fn run_list(
         }
     } else {
         if rows.is_empty() {
-            use std::io::Write;
-            let _ = writeln!(out, "No records found.");
-            let _ = out.flush();
+            if let Err(error) = writeln!(out, "No records found.") {
+                return handle_err(error);
+            }
+            if let Err(error) = out.flush() {
+                return handle_err(error);
+            }
             return Ok(());
         }
 
@@ -290,7 +299,6 @@ fn run_list(
         }
 
         let mut print_row = |vals: &[String]| -> std::io::Result<()> {
-            use std::io::Write;
             for (i, val) in vals.iter().enumerate() {
                 let width = col_widths[i];
                 let is_numeric = i >= 3;
@@ -302,14 +310,6 @@ fn run_list(
             }
             writeln!(out)?;
             Ok(())
-        };
-
-        let handle_err = |e: std::io::Error| -> Result<(), Box<dyn std::error::Error>> {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                Ok(())
-            } else {
-                Err(e.into())
-            }
         };
 
         if let Err(e) = print_row(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>()) {
@@ -351,8 +351,10 @@ fn run_list(
         }
     }
 
-    let _ = out.flush();
-    Ok(())
+    match out.flush() {
+        Ok(()) => Ok(()),
+        Err(error) => handle_err(error),
+    }
 }
 
 #[cfg(test)]

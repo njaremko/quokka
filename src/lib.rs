@@ -2,7 +2,7 @@
 //!
 //! Buck2 owns execution and caching. This runner implements buck2's external
 //! test protocol: it serves the `TestExecutor` service (receiving one
-//! `ExternalRunnerSpec` per target), lists each target's tests via a cacheable
+//! `ExternalRunnerSpec` per target), lists each target's tests via an uncacheable
 //! `Execute2(Listing)`, then issues one `Execute2(Testing)` per discovered test
 //! and reports each result. See `DESIGN.md` for the full design.
 

@@ -24,10 +24,6 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
 
-/// Neutral per-test weight (ms) for tests with no recorded history, so a cold
-/// cache balances chunks evenly instead of piling unseen tests together.
-const UNSEEN_CHUNK_WEIGHT_MS: u64 = 50;
-
 /// How tests within a target are grouped into actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchMode {
